@@ -533,11 +533,12 @@ def register_btw(ids, sid):
     """Привязать message_id ответов бота к side-сессии, чтобы reply на них продолжал ветку."""
     if not sid or not ids:
         return
-    for mid in ids:
-        btw_threads[mid] = sid
-    while len(btw_threads) > BTW_CAP:
-        btw_threads.popitem(last=False)
-    save_state()
+    with state_lock:                    # мутации btw_threads под state_lock: save_state итерирует его
+        for mid in ids:
+            btw_threads[mid] = sid
+        while len(btw_threads) > BTW_CAP:
+            btw_threads.popitem(last=False)
+    save_state()                        # лок отпущен: save_state берёт state_lock сам (не реентрантный)
 
 def handle_side(chat_id, text, sid):
     """Продолжение side-ветки: reply на 💬-сообщение бота."""
@@ -606,8 +607,10 @@ def handle(chat_id, text):
         return
 
     # обычное сообщение ИЛИ проброс claude-слэша (/compact, /cost, кастомные)
-    if btw_threads:                          # вернулся в главный чат -> закрываем ВСЕ боковые
-        n = len(btw_threads); btw_threads.clear(); save_state()
+    if btw_threads and not t.startswith("/"):   # вернулся в главный (слэш-проброс — не «возврат») -> закрыть боковые
+        with state_lock:                        # мутации btw_threads под state_lock: save_state итерирует его
+            n = len(btw_threads); btw_threads.clear()
+        save_state()
         log(f"side закрыты ({n}): владелец написал в главный")
         send(chat_id, f"🗂 Закрыл боковые чаты ({n}).")
     with Typing(chat_id):
@@ -717,6 +720,98 @@ def cleanup_incoming():
         log("cleanup err", repr(e))
 
 # ---------- main loop ----------
+def process_update(upd):
+    """Один update: гейты и роутинг. Исключение отсюда не должно валить поллер (ловится в main)."""
+    is_edit = upd.get("edited_message") is not None
+    msg = upd.get("message") or upd.get("edited_message")
+    if not msg:
+        return
+    frm = (msg.get("from") or {}).get("id")
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "")
+    if frm != ALLOWED_ID or chat_id != ALLOWED_ID:      # только владелец и только его личный чат
+        log(f"IGNORED from id={frm} chat={chat_id}: {text[:60]!r}")
+        return
+    if is_edit and (msg.get("edit_date", 0) - msg.get("date", 0)) > 300:
+        log(f"IGNORED stale edit from {frm}: {text[:60]!r}")
+        return
+    if text.startswith("!"):                             # быстрый bash из белого списка (не через агента)
+        threading.Thread(target=handle_bang, args=(chat_id, text[1:].strip()), daemon=True).start()
+        return
+    rt = msg.get("reply_to_message") or {}               # reply на 💬-сообщение -> продолжение side-ветки
+    side_sid = btw_threads.get(rt.get("message_id")) if rt else None
+    if side_sid and text and not text.startswith("/"):
+        threading.Thread(target=safe_handle_side, args=(chat_id, text, side_sid), daemon=True).start()
+        return
+    mgid = msg.get("media_group_id")
+    if mgid and (msg.get("photo") or msg.get("document")):   # альбом -> буферизуем, отдадим одним ходом
+        if msg.get("photo"):
+            buffer_group(chat_id, mgid, "photo", msg["photo"][-1]["file_id"], "", (msg.get("caption") or "").strip())
+        else:
+            doc = msg["document"]
+            buffer_group(chat_id, mgid, "document", doc["file_id"], doc.get("file_name", ""), (msg.get("caption") or "").strip())
+        return
+    prompt = text
+    if not prompt:                                       # не текст -> картинка/файл/голос/видео?
+        cap = (msg.get("caption") or "").strip()
+        if msg.get("photo"):
+            path = download_file(msg["photo"][-1]["file_id"], "img.jpg")
+            if not path:
+                send(chat_id, "⚠️ Не смог скачать картинку."); return
+            prompt = (f"[Пользователь прислал изображение, сохранено: {path}]\n"
+                      + (cap or "Посмотри изображение (через Read) и ответь по нему."))
+        elif msg.get("document"):
+            doc = msg["document"]
+            path = download_file(doc["file_id"], doc.get("file_name", ""))
+            if not path:
+                send(chat_id, "⚠️ Не смог скачать файл."); return
+            prompt = (f"[Пользователь прислал файл, сохранён: {path} (имя: {doc.get('file_name','?')})]\n"
+                      + (cap or "Посмотри/обработай этот файл и ответь."))
+        elif msg.get("voice") or msg.get("audio"):       # голосовые и аудиофайлы (кружки -> ниже, как видео)
+            v = msg.get("voice") or msg.get("audio")
+            path = download_file(v["file_id"], "voice.ogg")
+            if not path:
+                send(chat_id, "⚠️ Не смог скачать голосовое."); return
+            with Typing(chat_id):
+                heard = transcribe(path)
+            if not heard:
+                send(chat_id, "⚠️ Не распознал голос (whisper). Проверь WHISPER_BIN в конфиге."); return
+            send(chat_id, "🎙 услышал: «" + heard + "»")
+            prompt = (cap + "\n" if cap else "") + heard
+        elif msg.get("video") or msg.get("video_note"):  # видео И кружки: распознаём ТОЛЬКО звук
+            vid = msg.get("video") or msg.get("video_note")
+            is_note = msg.get("video_note") is not None
+            if vid.get("file_size", 0) > TG_FILE_LIMIT:
+                send(chat_id, "⚠️ Ролик больше 20 МБ — Bot API такое не отдаёт. Пришли покороче или сожми."); return
+            path = download_file(vid["file_id"], "video.mp4")
+            if not path:
+                send(chat_id, "⚠️ Не смог скачать ролик."); return
+            audio = extract_audio(path)
+            if audio:
+                try: os.remove(path)                     # тяжёлый исходник больше не нужен
+                except Exception as e: log("rm video err", repr(e))
+                tpath = audio
+            else:
+                tpath = path                             # ffmpeg не смог — whisper декодирует сам
+            with Typing(chat_id):
+                heard = transcribe(tpath)
+            if tpath == path:
+                try: os.remove(path)
+                except Exception as e: log("rm video err", repr(e))
+            if not heard:
+                send(chat_id, "⚠️ Не расслышал речи (или там нет аудио)."); return
+            send(chat_id, "🎙 услышал: «" + heard + "»")
+            kind = "кружок (video_note)" if is_note else "видео"
+            prompt = (f"[Владелец прислал {kind}; видеоряд НЕ анализируется — распознана только аудиодорожка. "
+                      "Транскрипт ниже.]\n" + (cap + "\n" if cap else "") + heard)
+        else:
+            send(chat_id, "Умею текст, голос, видео (только звук), картинки и файлы (и могу присылать файлы по запросу)."); return
+    if is_edit:
+        prompt = "[правка сообщения — актуальная версия:]\n" + prompt
+    prompt = context_prefix(msg) + prompt                # reply/forward-контекст
+    log(f"msg from {frm}{' [edit]' if is_edit else ''}: {prompt[:80]!r}")
+    threading.Thread(target=safe_handle, args=(chat_id, prompt), daemon=True).start()
+
 def main():
     global offset
     load_state()
@@ -736,96 +831,12 @@ def main():
             time.sleep(3); continue
         for upd in resp["result"]:
             offset = upd["update_id"] + 1
-            is_edit = upd.get("edited_message") is not None
-            msg = upd.get("message") or upd.get("edited_message")
-            if not msg:
-                continue
-            frm = (msg.get("from") or {}).get("id")
-            chat_id = msg["chat"]["id"]
-            text = msg.get("text", "")
-            if frm != ALLOWED_ID or chat_id != ALLOWED_ID:      # только владелец и только его личный чат
-                log(f"IGNORED from id={frm} chat={chat_id}: {text[:60]!r}")
-                continue
-            if is_edit and (msg.get("edit_date", 0) - msg.get("date", 0)) > 300:
-                log(f"IGNORED stale edit from {frm}: {text[:60]!r}")
-                continue
-            if text.startswith("!"):                             # быстрый bash из белого списка (не через агента)
-                threading.Thread(target=handle_bang, args=(chat_id, text[1:].strip()), daemon=True).start()
-                continue
-            rt = msg.get("reply_to_message") or {}               # reply на 💬-сообщение -> продолжение side-ветки
-            side_sid = btw_threads.get(rt.get("message_id")) if rt else None
-            if side_sid and text and not text.startswith("/"):
-                threading.Thread(target=safe_handle_side, args=(chat_id, text, side_sid), daemon=True).start()
-                continue
-            mgid = msg.get("media_group_id")
-            if mgid and (msg.get("photo") or msg.get("document")):   # альбом -> буферизуем, отдадим одним ходом
-                if msg.get("photo"):
-                    buffer_group(chat_id, mgid, "photo", msg["photo"][-1]["file_id"], "", (msg.get("caption") or "").strip())
-                else:
-                    doc = msg["document"]
-                    buffer_group(chat_id, mgid, "document", doc["file_id"], doc.get("file_name", ""), (msg.get("caption") or "").strip())
-                continue
-            prompt = text
-            if not prompt:                                       # не текст -> картинка/файл/голос/видео?
-                cap = (msg.get("caption") or "").strip()
-                if msg.get("photo"):
-                    path = download_file(msg["photo"][-1]["file_id"], "img.jpg")
-                    if not path:
-                        send(chat_id, "⚠️ Не смог скачать картинку."); continue
-                    prompt = (f"[Пользователь прислал изображение, сохранено: {path}]\n"
-                              + (cap or "Посмотри изображение (через Read) и ответь по нему."))
-                elif msg.get("document"):
-                    doc = msg["document"]
-                    path = download_file(doc["file_id"], doc.get("file_name", ""))
-                    if not path:
-                        send(chat_id, "⚠️ Не смог скачать файл."); continue
-                    prompt = (f"[Пользователь прислал файл, сохранён: {path} (имя: {doc.get('file_name','?')})]\n"
-                              + (cap or "Посмотри/обработай этот файл и ответь."))
-                elif msg.get("voice") or msg.get("audio"):       # голосовые и аудиофайлы (кружки -> ниже, как видео)
-                    v = msg.get("voice") or msg.get("audio")
-                    path = download_file(v["file_id"], "voice.ogg")
-                    if not path:
-                        send(chat_id, "⚠️ Не смог скачать голосовое."); continue
-                    with Typing(chat_id):
-                        heard = transcribe(path)
-                    if not heard:
-                        send(chat_id, "⚠️ Не распознал голос (whisper). Проверь WHISPER_BIN в конфиге."); continue
-                    send(chat_id, "🎙 услышал: «" + heard + "»")
-                    prompt = (cap + "\n" if cap else "") + heard
-                elif msg.get("video") or msg.get("video_note"):  # видео И кружки: распознаём ТОЛЬКО звук
-                    vid = msg.get("video") or msg.get("video_note")
-                    is_note = msg.get("video_note") is not None
-                    if vid.get("file_size", 0) > TG_FILE_LIMIT:
-                        send(chat_id, "⚠️ Ролик больше 20 МБ — Bot API такое не отдаёт. Пришли покороче или сожми."); continue
-                    path = download_file(vid["file_id"], "video.mp4")
-                    if not path:
-                        send(chat_id, "⚠️ Не смог скачать ролик."); continue
-                    audio = extract_audio(path)
-                    if audio:
-                        try: os.remove(path)                     # тяжёлый исходник больше не нужен
-                        except Exception as e: log("rm video err", repr(e))
-                        tpath = audio
-                    else:
-                        tpath = path                             # ffmpeg не смог — whisper декодирует сам
-                    with Typing(chat_id):
-                        heard = transcribe(tpath)
-                    if tpath == path:
-                        try: os.remove(path)
-                        except Exception as e: log("rm video err", repr(e))
-                    if not heard:
-                        send(chat_id, "⚠️ Не расслышал речи (или там нет аудио)."); continue
-                    send(chat_id, "🎙 услышал: «" + heard + "»")
-                    kind = "кружок (video_note)" if is_note else "видео"
-                    prompt = (f"[Владелец прислал {kind}; видеоряд НЕ анализируется — распознана только аудиодорожка. "
-                              "Транскрипт ниже.]\n" + (cap + "\n" if cap else "") + heard)
-                else:
-                    send(chat_id, "Умею текст, голос, видео (только звук), картинки и файлы (и могу присылать файлы по запросу)."); continue
-            if is_edit:
-                prompt = "[правка сообщения — актуальная версия:]\n" + prompt
-            prompt = context_prefix(msg) + prompt                # reply/forward-контекст
-            log(f"msg from {frm}{' [edit]' if is_edit else ''}: {prompt[:80]!r}")
-            threading.Thread(target=safe_handle, args=(chat_id, prompt), daemon=True).start()
-        save_state()                                             # персистим offset (и прочее) после батча
+            try:
+                process_update(upd)                      # кривой update не должен валить поллер
+            except Exception as e:
+                log("update err", repr(e))
+        if resp["result"]:
+            save_state()                                 # персистим offset (и прочее) после непустого батча
 
 if __name__ == "__main__":
     main()
