@@ -1,0 +1,51 @@
+# tgbridge — packaging & deps, kept for the day this moves to another machine.
+#
+# The bridge core is deliberately STDLIB-ONLY (zero pip deps). Everything heavy
+# is system binaries — see SYSTEM REQUIREMENTS below. The only pip-installable
+# dependency is openai-whisper, and it is optional (voice/video transcription).
+#
+# Quick migration checklist:
+#   1) git clone / rsync the repo to ~/dev/tgbridge on the new machine
+#      (paths matter — see WARNING below)
+#   2) poetry install --extras voice     # or plain `poetry install` if no voice needed
+#   3) install system bits: claude CLI (Claude Code), ffmpeg; curl+bash for tgsend
+#   4) copy ~/.config/tgbridge/config.env (chmod 600, dir 700); state.json optional
+#   5) autostart: macOS — ~/Library/LaunchAgents/com.local.tgbridge.plist
+#      (ProgramArguments: <python3> <repo>/bridge.py, KeepAlive, log to ~/Library/Logs);
+#      Linux — systemd unit: ExecStart=<python3> <repo>/bridge.py, Restart=always,
+#      StandardOutput/Error=append:<logfile>
+#
+# SYSTEM REQUIREMENTS (not installable via poetry):
+#   - claude CLI at ~/.local/bin/claude, or set CLAUDE_BIN in config.env
+#   - ffmpeg on PATH next to whisper, or set FFMPEG_BIN in config.env
+#     (needed for video/video_note audio extraction; whisper also uses it to decode)
+#   - curl + bash (tgsend helper)
+#
+# WARNING — hardcoded paths in bridge.py:
+#   INCOMING/OUTGOING/TGSEND point at ~/dev/tgbridge/... — keep the repo at that
+#   path or adjust the constants at the top of bridge.py.
+#   WHISPER_BIN defaults to a conda env path; on a new machine set WHISPER_BIN in
+#   config.env (e.g. the venv's bin/whisper after `poetry install --extras voice`).
+
+[project]
+name = "tgbridge"
+version = "2.1.0"
+description = "Personal Telegram bridge to headless Claude Code: stdlib-only core, optional whisper voice/video transcription"
+authors = [{ name = "Den", email = "grydenisbak@gmail.com" }]
+# Tested on 3.9 (bridge, anaconda base) and 3.13 (whisper env ml13).
+# Upper bound kept at 3.14 so `poetry lock` never fights torch/whisper caps.
+requires-python = ">=3.9,<3.14"
+dependencies = []
+
+[project.optional-dependencies]
+voice = ["openai-whisper>=20231117"]
+
+[project.scripts]
+tgbridge = "bridge:main"
+
+[tool.poetry]
+packages = [{ include = "bridge.py" }]
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
