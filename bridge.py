@@ -437,6 +437,19 @@ HELP = (
     "✏️ Правка недавнего (≤5 мин) сообщения = перезапуск с исправленным текстом.\n"
     "Попроси «пришли мне <файл>» — агент отправит файл в чат (длинные ответы тоже приходят файлом).")
 
+# Команды для меню Telegram (всплывают по "/"; регистрируются в setMyCommands при старте).
+BOT_COMMANDS = [
+    {"command": "reset",   "description": "начать новый диалог"},
+    {"command": "status",  "description": "статус: сессия, стоимость, боковые чаты"},
+    {"command": "context", "description": "заполнение контекста + стоимость"},
+    {"command": "cancel",  "description": "прервать текущий ход агента"},
+    {"command": "effort",  "description": "reasoning: low | medium | high | xhigh | max"},
+    {"command": "btw",     "description": "боковой вопрос, не трогая главный диалог"},
+    {"command": "loop",    "description": "повторять промпт каждые N сек (/loop stop — стоп)"},
+    {"command": "compact", "description": "сжать контекст диалога"},
+    {"command": "help",    "description": "что умею и все команды"},
+]
+
 # ---------- loop ----------
 def start_loop(chat_id, interval, prompt):
     global loop_thread, loop_stop, total_cost
@@ -712,6 +725,7 @@ def main():
     who = me["result"]["username"] if me and me.get("ok") else "??? (нет сети или неверный токен — жду)"
     log(f"tgbridge up | bot=@{who} | allowed_id={ALLOWED_ID} | workdir={WORKDIR} | claude={CLAUDE_BIN} | effort={EFFORT}")
     tg("deleteWebhook")                     # на случай ранее выставленного вебхука
+    tg("setMyCommands", commands=json.dumps(BOT_COMMANDS, ensure_ascii=False))  # меню по "/"
     last_cleanup = 0
     while True:
         if time.time() - last_cleanup > 86400:
