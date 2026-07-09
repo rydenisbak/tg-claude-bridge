@@ -293,13 +293,16 @@ def extract_audio(video_path):
         [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-c:a", "copy", out],            # быстро, без перекодирования
         [FFMPEG_BIN, "-y", "-i", video_path, "-vn", "-ac", "1", "-c:a", "aac", "-b:a", "48k", out],
     ]
+    last_err = ""
     for cmd in attempts:
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         except Exception as e:
-            log("ffmpeg err", repr(e)); continue
+            last_err = repr(e); log("ffmpeg err", repr(e)); continue
         if p.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
             return out
+        last_err = (p.stderr or "").strip()[-300:]
+    log("extract_audio: ffmpeg не дал звук из", os.path.basename(video_path), "| stderr:", last_err)
     return None
 
 def transcribe(path):
@@ -749,8 +752,8 @@ def main():
                         send(chat_id, "⚠️ Не смог скачать файл."); continue
                     prompt = (f"[Пользователь прислал файл, сохранён: {path} (имя: {doc.get('file_name','?')})]\n"
                               + (cap or "Посмотри/обработай этот файл и ответь."))
-                elif msg.get("voice") or msg.get("video_note") or msg.get("audio"):
-                    v = msg.get("voice") or msg.get("video_note") or msg.get("audio")
+                elif msg.get("voice") or msg.get("audio"):       # голосовые и аудиофайлы (кружки -> ниже, как видео)
+                    v = msg.get("voice") or msg.get("audio")
                     path = download_file(v["file_id"], "voice.ogg")
                     if not path:
                         send(chat_id, "⚠️ Не смог скачать голосовое."); continue
@@ -760,29 +763,31 @@ def main():
                         send(chat_id, "⚠️ Не распознал голос (whisper). Проверь WHISPER_BIN в конфиге."); continue
                     send(chat_id, "🎙 услышал: «" + heard + "»")
                     prompt = (cap + "\n" if cap else "") + heard
-                elif msg.get("video"):                           # видео: распознаём ТОЛЬКО звук, видеоряд не смотрим
-                    vid = msg["video"]
+                elif msg.get("video") or msg.get("video_note"):  # видео И кружки: распознаём ТОЛЬКО звук
+                    vid = msg.get("video") or msg.get("video_note")
+                    is_note = msg.get("video_note") is not None
                     if vid.get("file_size", 0) > TG_FILE_LIMIT:
-                        send(chat_id, "⚠️ Видео больше 20 МБ — Bot API такое не отдаёт. Пришли покороче или сожми."); continue
+                        send(chat_id, "⚠️ Ролик больше 20 МБ — Bot API такое не отдаёт. Пришли покороче или сожми."); continue
                     path = download_file(vid["file_id"], "video.mp4")
                     if not path:
-                        send(chat_id, "⚠️ Не смог скачать видео."); continue
+                        send(chat_id, "⚠️ Не смог скачать ролик."); continue
                     audio = extract_audio(path)
                     if audio:
-                        try: os.remove(path)                     # тяжёлый видос больше не нужен
-                        except Exception: pass
+                        try: os.remove(path)                     # тяжёлый исходник больше не нужен
+                        except Exception as e: log("rm video err", repr(e))
                         tpath = audio
                     else:
-                        tpath = path                             # ffmpeg не смог — whisper декодирует видео сам
+                        tpath = path                             # ffmpeg не смог — whisper декодирует сам
                     with Typing(chat_id):
                         heard = transcribe(tpath)
                     if tpath == path:
                         try: os.remove(path)
-                        except Exception: pass
+                        except Exception as e: log("rm video err", repr(e))
                     if not heard:
-                        send(chat_id, "⚠️ Не расслышал речи в видео (или там нет аудио)."); continue
+                        send(chat_id, "⚠️ Не расслышал речи (или там нет аудио)."); continue
                     send(chat_id, "🎙 услышал: «" + heard + "»")
-                    prompt = ("[Владелец прислал видео; видеоряд НЕ анализируется — распознана только аудиодорожка. "
+                    kind = "кружок (video_note)" if is_note else "видео"
+                    prompt = (f"[Владелец прислал {kind}; видеоряд НЕ анализируется — распознана только аудиодорожка. "
                               "Транскрипт ниже.]\n" + (cap + "\n" if cap else "") + heard)
                 else:
                     send(chat_id, "Умею текст, голос, видео (только звук), картинки и файлы (и могу присылать файлы по запросу)."); continue
