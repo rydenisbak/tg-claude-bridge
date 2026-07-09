@@ -135,6 +135,7 @@ def save_state():
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
+            os.chmod(tmp, 0o600)            # как config.env рядом
             os.replace(tmp, STATE_FILE)     # атомарно
         except Exception as e:
             log("save_state err", repr(e))
