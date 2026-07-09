@@ -426,6 +426,7 @@ HELP = (
     "/effort low|medium|high|xhigh|max — скорость/качество на лету\n"
     "/btw <вопрос> — side-чат: видит контекст диалога, но НЕ влияет на него.\n"
     "   Продолжить side-чат — ответь (reply) на 💬-сообщение бота.\n"
+    "   Вернулся в главный (обычное сообщение) — все боковые закрываются.\n"
     "/loop <сек> <промпт> — повторять промпт каждые N сек\n"
     "/loop stop  (или /stop) — остановить loop\n"
     "/compact и другие claude-слэши — пробрасываются агенту\n"
@@ -592,6 +593,10 @@ def handle(chat_id, text):
         return
 
     # обычное сообщение ИЛИ проброс claude-слэша (/compact, /cost, кастомные)
+    if btw_threads:                          # вернулся в главный чат -> закрываем ВСЕ боковые
+        n = len(btw_threads); btw_threads.clear(); save_state()
+        log(f"side закрыты ({n}): владелец написал в главный")
+        send(chat_id, f"🗂 Закрыл боковые чаты ({n}).")
     with Typing(chat_id):
         with main_lock:
             gen = reset_gen
