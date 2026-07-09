@@ -114,8 +114,10 @@ last_data   = None            # последний json основного ди�
 total_cost  = 0.0             # ≈ по API-тарифу, за всё время; с подписки НЕ списывается
 offset      = None            # getUpdates offset (персистится, переживает рестарт)
 reset_gen   = 0               # счётчик /reset: гонка «reset во время хода»
-claude_lock = threading.Lock()   # сериализуем все запуски агента
-current_proc = None           # текущий Popen агента (для /cancel)
+main_lock   = threading.Lock()   # ходы главного диалога (сериализуются между собой)
+side_lock   = threading.Lock()   # /btw, reply-ветки, loop — своя дорожка, параллельно главному
+cost_lock   = threading.Lock()   # total_cost += из двух дорожек одновременно -> без гонки
+current_procs = set()         # живые Popen агента (для /cancel; их может быть до двух)
 proc_lock   = threading.Lock()
 loop_stop   = None            # threading.Event текущего loop (None если нет)
 loop_thread = None
@@ -325,12 +327,8 @@ def transcribe(path):
         return None
 
 # ---------- claude ----------
-def cancel_current():
-    """Убить текущий ход агента (группу процессов). Вернуть True, если было что убивать."""
-    with proc_lock:
-        p = current_proc
-    if not p or p.poll() is not None:
-        return False
+def _kill(p):
+    """SIGTERM группе процессов, через 5с — SIGKILL (claude плодит детей-bash)."""
     try:
         os.killpg(os.getpgid(p.pid), signal.SIGTERM)
     except Exception:
@@ -343,11 +341,23 @@ def cancel_current():
                 try: p.kill()
                 except Exception: pass
     t = threading.Timer(5, hard); t.daemon = True; t.start()
-    return True
+
+def cancel_all():
+    """Убить все текущие ходы агента (главный и side). Вернуть, сколько убили."""
+    with proc_lock:
+        procs = [p for p in current_procs if p.poll() is None]
+    for p in procs:
+        _kill(p)
+    return len(procs)
+
+def add_cost(data):
+    """Прибавить стоимость хода. Зовётся из двух дорожек -> под cost_lock (иначе потерянные +=)."""
+    global total_cost
+    with cost_lock:
+        total_cost += (data or {}).get("total_cost_usd", 0) or 0
 
 def run_claude(prompt, resume=None, fork=False):
     """Запустить headless claude (промпт через stdin). Возврат (текст, data|None)."""
-    global current_proc
     cmd = [CLAUDE_BIN, "-p", "--output-format", "json",
            "--permission-mode", PERM_MODE, "--effort", EFFORT,
            "--append-system-prompt", full_sysprompt()]
@@ -361,11 +371,11 @@ def run_claude(prompt, resume=None, fork=False):
     except Exception as e:
         return f"⚠️ Не смог запустить агента: {e}", None
     with proc_lock:
-        current_proc = p
+        current_procs.add(p)
     try:
         out, err = p.communicate(input=prompt, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        cancel_current()
+        _kill(p)
         try: p.communicate(timeout=8)
         except Exception: pass
         return f"⏱️ Агент не уложился в {TIMEOUT}s.", None
@@ -373,8 +383,7 @@ def run_claude(prompt, resume=None, fork=False):
         return f"⚠️ Ошибка агента: {e}", None
     finally:
         with proc_lock:
-            if current_proc is p:
-                current_proc = None
+            current_procs.discard(p)
     if p.returncode is not None and p.returncode < 0:   # убит сигналом (/cancel или таймаут-kill)
         return "⏹️ (прервано)", None
     try:
@@ -401,7 +410,7 @@ def status_text():
             f"диалог: {'активен ' + session_id[:8] + '…' if session_id else 'новый (пусто)'}\n"
             f"стоимость: ${total_cost:.4f} (за всё время, ≈ API-тариф; с подписки НЕ списывается)\n"
             f"loop: {'работает' if running else 'нет'}\n"
-            f"агент занят: {'да' if claude_lock.locked() else 'нет'}\n"
+            f"агент занят: главный={'да' if main_lock.locked() else 'нет'}, side={'да' if side_lock.locked() else 'нет'}\n"
             f"side-чатов в памяти: {len(btw_threads)}\n"
             f"effort: {EFFORT}\n"
             f"workdir: {WORKDIR}")
@@ -438,10 +447,10 @@ def start_loop(chat_id, interval, prompt):
         global total_cost
         send(chat_id, f"🔁 Loop запущен: каждые {interval}s.\nОстановить: /loop stop")
         while not stop.is_set():
-            with claude_lock:                           # тик не идёт параллельно основному диалогу
+            with side_lock:                             # loop на side-дорожке: не морозит главный диалог
                 if stop.is_set(): break
                 res, data = run_claude(prompt, resume=None)   # каждый тик — свежая сессия
-                total_cost += (data or {}).get("total_cost_usd", 0) or 0
+            add_cost(data)
             save_state()
             if stop.is_set(): break
             send(chat_id, "🔁 " + res)
@@ -518,11 +527,10 @@ def register_btw(ids, sid):
 
 def handle_side(chat_id, text, sid):
     """Продолжение side-ветки: reply на 💬-сообщение бота."""
-    global total_cost
     with Typing(chat_id):
-        with claude_lock:
+        with side_lock:
             res, data = run_claude(text, resume=sid)    # без fork: продолжаем именно эту ветку
-            total_cost += (data or {}).get("total_cost_usd", 0) or 0
+    add_cost(data)
     save_state()
     new_sid = (data or {}).get("session_id") or sid
     ids = send_reply(chat_id, "💬 " + res)
@@ -551,8 +559,10 @@ def handle(chat_id, text):
         send(chat_id, fmt_context(last_data) if last_data else "Пока нет данных — напиши что-нибудь агенту."); return
     if low in ("/stop", "/cancel"):
         if loop_stop: loop_stop.set()
-        if low == "/cancel" and cancel_current():
-            send(chat_id, "⏹️ Прервал текущий ход."); return
+        if low == "/cancel":
+            n = cancel_all()
+            if n:
+                send(chat_id, f"⏹️ Прервал текущие ходы ({n})."); return
         send(chat_id, "⏹️ Остановил loop (если был)."); return
     if low.startswith("/effort"):
         parts = t.split()
@@ -571,9 +581,9 @@ def handle(chat_id, text):
             send(chat_id, "Использование: /btw <вопрос> — side-чат: видит контекст диалога, но не меняет его.\n"
                           "Продолжить — ответь (reply) на 💬-сообщение."); return
         with Typing(chat_id):
-            with claude_lock:
+            with side_lock:
                 res, data = run_claude(q, resume=session_id, fork=bool(session_id))
-                total_cost += (data or {}).get("total_cost_usd", 0) or 0
+        add_cost(data)
         save_state()
         sid = (data or {}).get("session_id")
         hint = "\n\n↩️ Ответь (reply) на это сообщение, чтобы продолжить side-чат." if sid else ""
@@ -583,13 +593,13 @@ def handle(chat_id, text):
 
     # обычное сообщение ИЛИ проброс claude-слэша (/compact, /cost, кастомные)
     with Typing(chat_id):
-        with claude_lock:
+        with main_lock:
             gen = reset_gen
             res, data = run_claude(t, resume=session_id)
             if gen == reset_gen and data and data.get("session_id"):   # /reset во время хода -> не воскрешаем
                 session_id = data["session_id"]
                 last_data  = data
-            total_cost += (data or {}).get("total_cost_usd", 0) or 0
+    add_cost(data)
     save_state()
     send_reply(chat_id, res)
 
