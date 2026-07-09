@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Отправить файл владельцу в Telegram (использует токен+id из config.env).
+#   tgsend <path> [caption...]   — отправить файл (картинки как фото, остальное документом)
+#   tgsend --check               — проверить конфиг, ничего не отправляя
+set -euo pipefail
+CFG="$HOME/.config/tgbridge/config.env"
+val() { grep -E "^$1=" "$CFG" 2>/dev/null | head -1 | sed -E "s/^$1=//; s/^[\"']//; s/[\"']\$//"; }
+TOKEN="$(val TG_BOT_TOKEN)"; CHAT="$(val TG_ALLOWED_ID)"
+[ -n "$TOKEN" ] && [ -n "$CHAT" ] || { echo "tgsend: нет TG_BOT_TOKEN/TG_ALLOWED_ID в $CFG" >&2; exit 1; }
+
+if [ "${1:-}" = "--check" ]; then echo "tgsend: config OK (chat=$CHAT)"; exit 0; fi
+
+FILE="${1:?usage: tgsend <path> [caption]}"; shift || true
+CAP="${*:-}"
+[ -f "$FILE" ] || { echo "tgsend: нет файла: $FILE" >&2; exit 1; }
+
+api="https://api.telegram.org/bot${TOKEN}"
+put() { curl -sS -f "$api/$1" -F "chat_id=$CHAT" -F "$2=@$FILE" ${CAP:+-F "caption=$CAP"} -o /dev/null; }
+
+ext="$(printf '%s' "${FILE##*.}" | tr '[:upper:]' '[:lower:]')"
+case "$ext" in
+  jpg|jpeg|png|webp) put sendPhoto photo || put sendDocument document ;;
+  *)                 put sendDocument document ;;
+esac && echo "tgsend: отправлено $FILE" || { echo "tgsend: ошибка отправки $FILE" >&2; exit 1; }
