@@ -15,7 +15,8 @@ CAP="${*:-}"
 [ -f "$FILE" ] || { echo "tgsend: нет файла: $FILE" >&2; exit 1; }
 
 api="https://api.telegram.org/bot${TOKEN}"
-put() { curl -sS -f "$api/$1" -F "chat_id=$CHAT" -F "$2=@$FILE" ${CAP:+-F "caption=$CAP"} -o /dev/null; }
+# chat_id/caption — только как строки (--form-string), иначе caption вида "@f" curl примет за файл.
+put() { curl -sS -f "$api/$1" --form-string "chat_id=$CHAT" -F "$2=@$FILE" ${CAP:+--form-string "caption=$CAP"} -o /dev/null; }
 
 ext="$(printf '%s' "${FILE##*.}" | tr '[:upper:]' '[:lower:]')"
 case "$ext" in
