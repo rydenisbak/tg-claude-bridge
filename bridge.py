@@ -124,6 +124,22 @@ loop_thread = None
 btw_threads = collections.OrderedDict()   # message_id(int) -> side session_id(str)
 BTW_CAP     = 200
 state_lock  = threading.Lock()            # save_state зовут из разных потоков -> сериализуем запись
+bash_lock   = threading.Lock()            # !-команды строго по одной: общий bash_cwd
+jobs_active = 0                           # ходы агента: в работе + в очереди (для /status)
+jobs_lock   = threading.Lock()
+
+class Job:
+    """Счётчик ходов агента. offset подтверждается при приёме (at-most-once) —
+    перед перезапуском моста смотри /status: «задач у агента» должно быть 0."""
+    def __enter__(self):
+        global jobs_active
+        with jobs_lock:
+            jobs_active += 1
+        return self
+    def __exit__(self, *a):
+        global jobs_active
+        with jobs_lock:
+            jobs_active -= 1
 
 def log(*a):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
@@ -148,6 +164,10 @@ def load_state():
         if not os.path.isfile(STATE_FILE):
             return
         d = json.load(open(STATE_FILE, encoding="utf-8"))
+        try:
+            os.chmod(STATE_FILE, 0o600)     # старый state мог остаться с широкими правами
+        except OSError:
+            pass
         session_id = d.get("session_id")
         total_cost = float(d.get("total_cost", 0) or 0)
         offset     = d.get("offset")
@@ -243,15 +263,19 @@ def send_reply(chat_id, text):
     """Ответ агента: очень длинный -> файлом, иначе обычным сообщением. Возврат: список message_id."""
     text = text if (text and text.strip()) else "(пустой ответ)"
     if len(text) > LONG_LIMIT:
-        path = os.path.join(OUTGOING, f"answer_{int(time.time())}.md")
+        # ns + id потока: main и side могут закончить в одну секунду -> имена не должны сталкиваться
+        path = os.path.join(OUTGOING, f"answer_{time.time_ns()}_{threading.get_ident()}.md")
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
             ids = send(chat_id, "📄 Ответ длинный — присылаю файлом.\n\n" + " ".join(text[:280].split()) + "…")
-            subprocess.run([TGSEND, path, "ответ Claude"], timeout=60)
+            subprocess.run([TGSEND, path, "ответ Claude"], timeout=60, check=True)  # fail -> фолбэк текстом ниже
             return ids
         except Exception as e:
             log("send_reply file err", repr(e))
+        finally:
+            try: os.remove(path)            # файл — транспорт; сам текст и так остаётся в чате
+            except OSError: pass
     return send(chat_id, text)
 
 def typing(chat_id):
@@ -276,7 +300,7 @@ def download_file(file_id, name_hint=""):
     if not fp:
         return None
     ext = os.path.splitext(fp)[1] or os.path.splitext(name_hint)[1] or ".bin"
-    dest = os.path.join(INCOMING, f"{int(time.time())}_{file_id[-8:]}{ext}")
+    dest = os.path.join(INCOMING, f"{time.time_ns()}_{file_id[-8:]}{ext}")   # ns: без коллизий в одну секунду
     try:
         urllib.request.urlretrieve(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", dest)
         return dest
@@ -411,6 +435,7 @@ def status_text():
             f"стоимость: ${total_cost:.4f} (за всё время, ≈ API-тариф; с подписки НЕ списывается)\n"
             f"loop: {'работает' if running else 'нет'}\n"
             f"агент занят: главный={'да' if main_lock.locked() else 'нет'}, side={'да' if side_lock.locked() else 'нет'}\n"
+            f"задач у агента (работа+очередь): {jobs_active}  ← перед рестартом моста должно быть 0\n"
             f"side-чатов в памяти: {len(btw_threads)}\n"
             f"effort: {EFFORT}\n"
             f"workdir: {WORKDIR}")
@@ -427,6 +452,7 @@ HELP = (
     "/btw <вопрос> — side-чат: видит контекст диалога, но НЕ влияет на него.\n"
     "   Продолжить side-чат — ответь (reply) на 💬-сообщение бота.\n"
     "   Вернулся в главный (обычное сообщение) — все боковые закрываются.\n"
+    "   Поздний 💬-ответ (пришёл уже после закрытия) — тоже можно продолжить reply'ем.\n"
     "/loop <сек> <промпт> — повторять промпт каждые N сек\n"
     "/loop stop  (или /stop) — остановить loop\n"
     "/compact и другие claude-слэши — пробрасываются агенту\n"
@@ -461,7 +487,7 @@ def start_loop(chat_id, interval, prompt):
         global total_cost
         send(chat_id, f"🔁 Loop запущен: каждые {interval}s.\nОстановить: /loop stop")
         while not stop.is_set():
-            with side_lock:                             # loop на side-дорожке: не морозит главный диалог
+            with Job(), side_lock:                      # loop на side-дорожке: не морозит главный диалог
                 if stop.is_set(): break
                 res, data = run_claude(prompt, resume=None)   # каждый тик — свежая сессия
             add_cost(data)
@@ -488,6 +514,10 @@ def handle_loop(chat_id, text):
 
 # ---------- ! bash (ограниченный белый список, как в jupyter) ----------
 def handle_bang(chat_id, cmd):
+    with bash_lock:                         # !-команды из потоков делят bash_cwd -> строго по одной
+        _handle_bang(chat_id, cmd)
+
+def _handle_bang(chat_id, cmd):
     global bash_cwd
     if not cmd:
         send(chat_id, "Использование: !<команда>, напр. !ls -la или !cd ~/dev\nРазрешено: " + " ".join(sorted(BASH_ALLOW))); return
@@ -542,7 +572,7 @@ def register_btw(ids, sid):
 
 def handle_side(chat_id, text, sid):
     """Продолжение side-ветки: reply на 💬-сообщение бота."""
-    with Typing(chat_id):
+    with Job(), Typing(chat_id):
         with side_lock:
             res, data = run_claude(text, resume=sid)    # без fork: продолжаем именно эту ветку
     add_cost(data)
@@ -595,7 +625,7 @@ def handle(chat_id, text):
         if not q:
             send(chat_id, "Использование: /btw <вопрос> — side-чат: видит контекст диалога, но не меняет его.\n"
                           "Продолжить — ответь (reply) на 💬-сообщение."); return
-        with Typing(chat_id):
+        with Job(), Typing(chat_id):
             with side_lock:
                 res, data = run_claude(q, resume=session_id, fork=bool(session_id))
         add_cost(data)
@@ -613,7 +643,7 @@ def handle(chat_id, text):
         save_state()
         log(f"side закрыты ({n}): владелец написал в главный")
         send(chat_id, f"🗂 Закрыл боковые чаты ({n}).")
-    with Typing(chat_id):
+    with Job(), Typing(chat_id):
         with main_lock:
             gen = reset_gen
             res, data = run_claude(t, resume=session_id)
@@ -705,19 +735,20 @@ def context_prefix(msg):
     return ("\n".join(parts) + "\n") if parts else ""
 
 # ---------- уборка ----------
-def cleanup_incoming():
-    """Удалить из incoming/ файлы старше 30 дней (не копить голосовые/фото вечно)."""
-    try:
-        cutoff = time.time() - 30 * 86400
-        for name in os.listdir(INCOMING):
-            fp = os.path.join(INCOMING, name)
-            try:
-                if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
-                    os.remove(fp)
-            except Exception:
-                pass
-    except Exception as e:
-        log("cleanup err", repr(e))
+def cleanup_old_files():
+    """Удалить из incoming/ и outgoing/ файлы старше 30 дней (медиа и длинные ответы — чувствительные)."""
+    cutoff = time.time() - 30 * 86400
+    for d in (INCOMING, OUTGOING):
+        try:
+            for name in os.listdir(d):
+                fp = os.path.join(d, name)
+                try:
+                    if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                        os.remove(fp)
+                except Exception:
+                    pass
+        except Exception as e:
+            log("cleanup err", repr(e))
 
 # ---------- main loop ----------
 def process_update(upd):
@@ -824,7 +855,7 @@ def main():
     last_cleanup = 0
     while True:
         if time.time() - last_cleanup > 86400:
-            last_cleanup = time.time(); cleanup_incoming()
+            last_cleanup = time.time(); cleanup_old_files()
         resp = tg("getUpdates", offset=offset, timeout=50,
                   allowed_updates='["message","edited_message"]')
         if not resp or not resp.get("ok"):
@@ -836,7 +867,9 @@ def main():
             except Exception as e:
                 log("update err", repr(e))
         if resp["result"]:
-            save_state()                                 # персистим offset (и прочее) после непустого батча
+            # at-most-once: offset подтверждается при ПРИЁМЕ батча, не по завершении ходов.
+            # Рестарт при живых/ожидающих задачах теряет их — смотри «задач у агента» в /status.
+            save_state()
 
 if __name__ == "__main__":
     main()
