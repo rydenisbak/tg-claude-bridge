@@ -2,7 +2,8 @@
 
 **Your phone → Telegram bot → headless Claude Code on your machine.**
 
-A single-file, stdlib-only Python bridge that turns a personal Telegram bot into a full
+A stdlib-only Python bridge (a lean `bridge.py` core plus three small leaf modules —
+config, formatting, media — zero pip deps) that turns a personal Telegram bot into a full
 Claude Code agent with access to your computer: bash, ssh, files, the works. Message the
 bot from anywhere — the agent runs on your laptop and replies to Telegram.
 
@@ -13,7 +14,7 @@ bot from anywhere — the agent runs on your laptop and replies to Telegram.
 └────────┘   sendMessage  └───────────┘      JSON result       └──────────────┘
 ```
 
-No frameworks, no pip dependencies for the core — `bridge.py` runs on bare Python 3.9+.
+No frameworks, no pip dependencies for the core — it runs on bare Python 3.9+.
 Voice/video transcription is the only optional extra (whisper + ffmpeg).
 
 ## Features
@@ -106,7 +107,10 @@ there or adjust the constants at the top of `bridge.py`.
 
 | File | Purpose |
 |---|---|
-| `bridge.py` | the whole bridge (single file, stdlib only) |
+| `bridge.py` | the core: state, Telegram I/O, agent calls, handlers, main loop |
+| `tgconfig.py` | config parsing, constants, logger, system prompt (leaf module) |
+| `tgformat.py` | markdown→Telegram-HTML, chunking, reply/forward context (leaf, pure) |
+| `tgmedia.py` | whisper transcription + ffmpeg audio extraction (leaf module) |
 | `tgsend` | bash+curl helper: send a file to the owner's chat |
 | `config.env.example` | config template → `~/.config/tgbridge/config.env` |
 | `com.local.tgbridge.plist.example` | launchd template (macOS autostart) |

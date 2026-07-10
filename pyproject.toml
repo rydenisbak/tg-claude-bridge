@@ -44,7 +44,12 @@ voice = ["openai-whisper>=20231117"]
 tgbridge = "bridge:main"
 
 [tool.poetry]
-packages = [{ include = "bridge.py" }]
+packages = [
+    { include = "bridge.py" },
+    { include = "tgconfig.py" },
+    { include = "tgformat.py" },
+    { include = "tgmedia.py" },
+]
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]
