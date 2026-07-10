@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- tgbridge launchd template.
+     1) Replace /Users/USERNAME with your home directory (launchd does NOT expand ~).
+     2) Point the first ProgramArguments string at a REAL python3 —
+        on macOS /usr/bin/python3 is an Xcode-license stub and will crash-loop.
+     3) Copy to ~/Library/LaunchAgents/com.local.tgbridge.plist and run:
+        launchctl load -w ~/Library/LaunchAgents/com.local.tgbridge.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.tgbridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USERNAME/path/to/python3</string>
+    <string>/Users/USERNAME/dev/tgbridge/bridge.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/USERNAME</string>
+    <key>PATH</key>
+    <string>/Users/USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/USERNAME</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/USERNAME/Library/Logs/tgbridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USERNAME/Library/Logs/tgbridge.log</string>
+</dict>
+</plist>
