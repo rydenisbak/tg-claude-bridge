@@ -124,6 +124,11 @@ loop_thread = None
 btw_threads = collections.OrderedDict()   # message_id(int) -> side session_id(str)
 BTW_CAP     = 200
 state_lock  = threading.Lock()            # save_state зовут из разных потоков -> сериализуем запись
+pending_reactions = []                    # реакции владельца, ждут следующего вопроса (персистятся)
+REACT_CAP   = 20
+bot_msgs    = collections.OrderedDict()   # message_id(int) -> сниппет ответа бота (чтобы знать, на ЧТО реакция)
+BOTMSG_CAP  = 200
+msgs_lock   = threading.Lock()            # bot_msgs мутируют разные потоки (send из двух дорожек)
 bash_lock   = threading.Lock()            # !-команды строго по одной: общий bash_cwd
 jobs_active = 0                           # ходы агента: в работе + в очереди (для /status)
 jobs_lock   = threading.Lock()
@@ -149,7 +154,8 @@ def save_state():
     with state_lock:                    # без лока конкурентные потоки бьют общий .tmp
         try:
             data = {"session_id": session_id, "total_cost": total_cost, "offset": offset,
-                    "effort": EFFORT, "btw": {str(k): v for k, v in btw_threads.items()}}
+                    "effort": EFFORT, "btw": {str(k): v for k, v in btw_threads.items()},
+                    "reactions": pending_reactions[:]}
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
@@ -179,7 +185,8 @@ def load_state():
                 btw_threads[int(k)] = v
             except Exception:
                 pass
-        log(f"state loaded: session={str(session_id)[:8]} offset={offset} effort={EFFORT} btw={len(btw_threads)}")
+        pending_reactions[:] = [str(x) for x in (d.get("reactions") or [])][-REACT_CAP:]
+        log(f"state loaded: session={str(session_id)[:8]} offset={offset} effort={EFFORT} btw={len(btw_threads)} react={len(pending_reactions)}")
     except Exception as e:
         log("load_state err", repr(e))
 
@@ -254,7 +261,13 @@ def send(chat_id, text):
         elif not r.get("ok"):                           # HTML не распарсился -> plain, чтобы не потерять
             r = _tg_send_retry(chat_id=chat_id, text=chunk) or r
         if r and r.get("ok"):
-            ids.append(r["result"]["message_id"])
+            mid = r["result"]["message_id"]
+            ids.append(mid)
+            snip = " ".join(chunk.split())[:150]                 # для контекста реакций: на ЧТО поставили
+            with msgs_lock:
+                bot_msgs[mid] = snip + ("…" if len(chunk) > 150 else "")
+                while len(bot_msgs) > BOTMSG_CAP:
+                    bot_msgs.popitem(last=False)
         else:
             log("send failed", str((r or {}).get("description", "network"))[:120])
     return ids
@@ -465,6 +478,7 @@ HELP = (
     "🎥 Видео — вытащу звук и распознаю (сам видеоряд не смотрю).\n"
     "📎 Картинку или файл — агент их посмотрит (через Read); альбомы тоже.\n"
     "✏️ Правка недавнего (≤5 мин) сообщения = перезапуск с исправленным текстом.\n"
+    "👍 Реакция на мой ответ — учту её как обратную связь при твоём СЛЕДУЮЩЕМ вопросе (отдельный запрос не трачу).\n"
     "Попроси «пришли мне <файл>» — агент отправит файл в чат (длинные ответы тоже приходят файлом).")
 
 # Команды для меню Telegram (всплывают по "/"; регистрируются в setMyCommands при старте).
@@ -574,8 +588,46 @@ def register_btw(ids, sid):
             btw_threads.popitem(last=False)
     save_state()                        # лок отпущен: save_state берёт state_lock сам (не реентрантный)
 
+# ---------- реакции (👍 и пр.): не отдельный ход, а контекст к следующему вопросу ----------
+def _react_emojis(lst):
+    out = []
+    for r in (lst or []):
+        t = r.get("type")
+        if t == "emoji" and r.get("emoji"):   out.append(r["emoji"])
+        elif t == "custom_emoji":             out.append("✨")
+        elif t == "paid":                     out.append("⭐")
+    return out
+
+def record_reaction(mr):
+    """Запомнить реакцию владельца. НЕ дёргает агента — уедет контекстом к следующему вопросу."""
+    added = [e for e in _react_emojis(mr.get("new_reaction")) if e not in _react_emojis(mr.get("old_reaction"))]
+    if not added:                             # реакцию сняли / нечего добавлять
+        return
+    mid = mr.get("message_id")
+    with msgs_lock:
+        snip = bot_msgs.get(mid)
+    if snip:
+        desc = f"[Владелец поставил реакцию {' '.join(added)} на твой ответ «{snip}» — учти как обратную связь.]"
+    else:
+        desc = f"[Владелец поставил реакцию {' '.join(added)} на твоё сообщение — учти как обратную связь.]"
+    with state_lock:
+        pending_reactions.append(desc)
+        del pending_reactions[:-REACT_CAP]    # держим последние REACT_CAP
+    save_state()
+    log(f"reaction {added} on msg {mid} -> буфер ({len(pending_reactions)})")
+
+def take_reactions():
+    """Забрать накопленные реакции как префикс к промпту и очистить (ровно один ход их получит)."""
+    with state_lock:
+        if not pending_reactions:
+            return ""
+        lines = pending_reactions[:]; pending_reactions.clear()
+    save_state()
+    return "\n".join(lines) + "\n"
+
 def handle_side(chat_id, text, sid):
     """Продолжение side-ветки: reply на 💬-сообщение бота."""
+    text = take_reactions() + text              # реакции уедут этим ходом
     with Job(), Typing(chat_id):
         with side_lock:
             res, data = run_claude(text, resume=sid)    # без fork: продолжаем именно эту ветку
@@ -629,6 +681,7 @@ def handle(chat_id, text):
         if not q:
             send(chat_id, "Использование: /btw <вопрос> — side-чат: видит контекст диалога, но не меняет его.\n"
                           "Продолжить — ответь (reply) на 💬-сообщение."); return
+        q = take_reactions() + q                 # реакции уедут этим side-ходом
         with Job(), Typing(chat_id):
             with side_lock:
                 res, data = run_claude(q, resume=session_id, fork=bool(session_id))
@@ -678,6 +731,7 @@ def handle(chat_id, text):
         save_state()
         log(f"side закрыты ({n}): владелец написал в главный")
         send(chat_id, f"🗂 Закрыл боковые чаты ({n}).")
+    t = take_reactions() + t                     # реакции владельца (если были) уедут этим ходом
     with Job(), Typing(chat_id):
         with main_lock:
             gen = reset_gen
@@ -788,6 +842,14 @@ def cleanup_old_files():
 # ---------- main loop ----------
 def process_update(upd):
     """Один update: гейты и роутинг. Исключение отсюда не должно валить поллер (ловится в main)."""
+    mr = upd.get("message_reaction")                     # реакция (👍 и пр.) -> буфер, БЕЗ вызова агента
+    if mr is not None:
+        u = mr.get("user") or {}
+        if u.get("id") == ALLOWED_ID and (mr.get("chat") or {}).get("id") == ALLOWED_ID:
+            record_reaction(mr)
+        else:
+            log(f"IGNORED reaction from id={u.get('id')}")
+        return
     is_edit = upd.get("edited_message") is not None
     msg = upd.get("message") or upd.get("edited_message")
     if not msg:
@@ -892,7 +954,7 @@ def main():
         if time.time() - last_cleanup > 86400:
             last_cleanup = time.time(); cleanup_old_files()
         resp = tg("getUpdates", offset=offset, timeout=50,
-                  allowed_updates='["message","edited_message"]')
+                  allowed_updates='["message","edited_message","message_reaction"]')
         if not resp or not resp.get("ok"):
             time.sleep(3); continue
         for upd in resp["result"]:
