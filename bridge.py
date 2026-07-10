@@ -380,10 +380,10 @@ def add_cost(data):
     with cost_lock:
         total_cost += (data or {}).get("total_cost_usd", 0) or 0
 
-def run_claude(prompt, resume=None, fork=False):
+def run_claude(prompt, resume=None, fork=False, effort=None):
     """Запустить headless claude (промпт через stdin). Возврат (текст, data|None)."""
     cmd = [CLAUDE_BIN, "-p", "--output-format", "json",
-           "--permission-mode", PERM_MODE, "--effort", EFFORT,
+           "--permission-mode", PERM_MODE, "--effort", effort or EFFORT,
            "--append-system-prompt", full_sysprompt()]
     if MODEL:            cmd += ["--model", MODEL]
     if resume:           cmd += ["--resume", resume]
@@ -418,10 +418,13 @@ def run_claude(prompt, resume=None, fork=False):
         return "⚠️ Ошибка агента: " + str(data.get("result", ""))[:1500], data
     return data.get("result", ""), data
 
+def ctx_tokens(d):
+    """Сколько токенов контекста съел ход (по usage его json)."""
+    u = (d or {}).get("usage") or {}
+    return u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+
 def fmt_context(d):
-    u = d.get("usage", {}) or {}
-    ctx = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-           + u.get("cache_creation_input_tokens", 0))
+    ctx = ctx_tokens(d)
     win = max((m.get("contextWindow", 0) for m in d.get("modelUsage", {}).values()), default=200000)
     pct = 100 * ctx / win if win else 0
     return (f"🧮 Контекст (последний ход): ~{ctx:,} / {win:,} токенов ({pct:.1f}%)\n"
@@ -455,7 +458,8 @@ HELP = (
     "   Поздний 💬-ответ (пришёл уже после закрытия) — тоже можно продолжить reply'ем.\n"
     "/loop <сек> <промпт> — повторять промпт каждые N сек\n"
     "/loop stop  (или /stop) — остановить loop\n"
-    "/compact и другие claude-слэши — пробрасываются агенту\n"
+    "/compact — сжать контекст диалога (покажу размер до → после)\n"
+    "Другие claude-слэши (/cost, кастомные) — пробрасываются агенту\n"
     "!<команда> — быстрый bash из белого списка (ls, cat, grep, git, cd, chmod…), без rm/mv\n\n"
     "🎙 Голосовое — распознаю (whisper) и выполню как команду.\n"
     "🎥 Видео — вытащу звук и распознаю (сам видеоряд не смотрю).\n"
@@ -472,7 +476,7 @@ BOT_COMMANDS = [
     {"command": "effort",  "description": "reasoning: low | medium | high | xhigh | max"},
     {"command": "btw",     "description": "боковой вопрос, не трогая главный диалог"},
     {"command": "loop",    "description": "повторять промпт каждые N сек (/loop stop — стоп)"},
-    {"command": "compact", "description": "сжать контекст диалога"},
+    {"command": "compact", "description": "сжать контекст (покажу до → после)"},
     {"command": "help",    "description": "что умею и все команды"},
 ]
 
@@ -635,8 +639,39 @@ def handle(chat_id, text):
         ids = send_reply(chat_id, "💬 (side) " + res + hint)
         register_btw(ids, sid)
         return
+    if low.startswith("/compact"):
+        if not session_id:
+            send(chat_id, "Диалог пуст — сжимать нечего. Напиши что-нибудь агенту."); return
+        before = ctx_tokens(last_data)                  # контекст последнего хода ДО сжатия
+        send(chat_id, "🗜 Сжимаю контекст…")
+        pres, pdata = "", None
+        with Job(), Typing(chat_id):
+            with main_lock:
+                gen = reset_gen
+                res, data = run_claude(t, resume=session_id)
+                add_cost(data)
+                if gen == reset_gen and data and data.get("session_id"):
+                    session_id = data["session_id"]
+                if data is None:                        # ошибка или /cancel
+                    save_state(); send(chat_id, res); return
+                if res.strip() and "not enough" in res.lower():   # компактить нечего
+                    save_state(); send(chat_id, "🤏 " + res.strip() + "\nКонтекст и так небольшой — сжимать нечего."); return
+                # usage compact-хода не отражает новый размер -> дешёвый пробный ход для честного замера
+                pres, pdata = run_claude("Ответь ровно: ок", resume=session_id, effort="low")
+                add_cost(pdata)
+                if gen == reset_gen and pdata and pdata.get("session_id"):
+                    session_id = pdata["session_id"]
+                    last_data  = pdata
+        save_state()
+        if pdata:
+            after = ctx_tokens(pdata)
+            head = (f"✅ Контекст сжат: ~{before:,} → ~{after:,} токенов\n" if before else "✅ Контекст сжат.\n")
+            send(chat_id, head + fmt_context(last_data))
+        else:
+            send(chat_id, "✅ Сжал, но замерить новый контекст не смог: " + pres)
+        return
 
-    # обычное сообщение ИЛИ проброс claude-слэша (/compact, /cost, кастомные)
+    # обычное сообщение ИЛИ проброс claude-слэша (/cost, кастомные слэши)
     if btw_threads and not t.startswith("/"):   # вернулся в главный (слэш-проброс — не «возврат») -> закрыть боковые
         with state_lock:                        # мутации btw_threads под state_lock: save_state итерирует его
             n = len(btw_threads); btw_threads.clear()
