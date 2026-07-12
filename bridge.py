@@ -56,6 +56,13 @@ msgs_lock   = threading.Lock()            # bot_msgs мутируют разны
 bash_lock   = threading.Lock()            # !-команды строго по одной: общий bash_cwd
 jobs_active = 0                           # ходы агента: в работе + в очереди (для /status)
 jobs_lock   = threading.Lock()
+ignored_seen = collections.OrderedDict()  # чужой id -> [кол-во, время последнего лога] (антифлуд-троттлинг)
+IGNORED_CAP  = 500
+alert_window = {}                         # чужой id -> кол-во с последней сводки владельцу
+last_alert_ts = 0.0
+ignored_lock  = threading.Lock()
+IGNORE_LOG_EVERY = 60                     # тот же чужой id логируем не чаще раза в 60с
+ALERT_COOLDOWN   = 300                    # сводку владельцу — не чаще раза в 5 мин (флуд не спамит уже тебя)
 
 class Job:
     """Счётчик ходов агента. offset подтверждается при приёме (at-most-once) —
@@ -650,6 +657,38 @@ def cleanup_old_files():
             log("cleanup err", repr(e))
 
 # ---------- main loop ----------
+def note_ignored(frm, chat_id, text, now=None):
+    """Чужое сообщение: троттлим лог, копим для сводки. Возврат: текст алерта владельцу или None.
+    Логируем первое сообщение от нового id, дальше не чаще IGNORE_LOG_EVERY (со счётчиком).
+    Сводку владельцу отдаём не чаще ALERT_COOLDOWN, чтобы флуд не превратился в спам ТЕБЕ."""
+    global last_alert_ts
+    now = now if now is not None else time.time()
+    with ignored_lock:
+        rec = ignored_seen.get(frm)
+        first = rec is None
+        if first:
+            rec = [0, 0.0]; ignored_seen[frm] = rec
+            while len(ignored_seen) > IGNORED_CAP:
+                ignored_seen.popitem(last=False)
+        rec[0] += 1
+        count = rec[0]
+        do_log = first or (now - rec[1] >= IGNORE_LOG_EVERY)
+        if do_log:
+            rec[1] = now
+        alert_window[frm] = alert_window.get(frm, 0) + 1
+        alert = None
+        if now - last_alert_ts >= ALERT_COOLDOWN:       # пора предупредить владельца (и есть о чём — нас сюда позвали)
+            last_alert_ts = now
+            n_ids, n_msg = len(alert_window), sum(alert_window.values())
+            ids_prev = ", ".join(str(k) for k in list(alert_window)[:5])
+            alert_window.clear()
+            alert = (f"👀 Кто-то стучится в бота: {n_ids} неизвестных id, {n_msg} сообщ. за ~{ALERT_COOLDOWN//60} мин.\n"
+                     f"id: {ids_prev}{' …' if n_ids > 5 else ''}\n"
+                     f"Все игнорируются — 0 токенов, ничего не выполнено. Если спамят и достаёт — пересоздай токен через BotFather.")
+    if do_log:
+        log(f"IGNORED from id={frm} chat={chat_id} (x{count}): {text[:60]!r}")
+    return alert
+
 def process_update(upd):
     """Один update: гейты и роутинг. Исключение отсюда не должно валить поллер (ловится в main)."""
     mr = upd.get("message_reaction")                     # реакция (👍 и пр.) -> буфер, БЕЗ вызова агента
@@ -668,7 +707,9 @@ def process_update(upd):
     chat_id = msg["chat"]["id"]
     text = msg.get("text", "")
     if frm != ALLOWED_ID or chat_id != ALLOWED_ID:      # только владелец и только его личный чат
-        log(f"IGNORED from id={frm} chat={chat_id}: {text[:60]!r}")
+        alert = note_ignored(frm, chat_id, text)        # троттлит лог, копит сводку
+        if alert:
+            threading.Thread(target=send, args=(ALLOWED_ID, alert), daemon=True).start()  # алерт не блокирует поллер
         return
     if is_edit and (msg.get("edit_date", 0) - msg.get("date", 0)) > 300:
         log(f"IGNORED stale edit from {frm}: {text[:60]!r}")
