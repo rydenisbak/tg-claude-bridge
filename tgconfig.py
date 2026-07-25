@@ -39,7 +39,8 @@ WORKDIR    = os.path.expanduser(C.get("WORKDIR", "~"))
 CLAUDE_BIN = os.path.expanduser(C.get("CLAUDE_BIN", "~/.local/bin/claude"))
 PERM_MODE  = C.get("PERMISSION_MODE", "bypassPermissions")
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-MODEL      = C.get("CLAUDE_MODEL", "")
+# MODEL живёт в bridge.py (как EFFORT): /model меняет её на лету, а from-import скопировал бы
+# значение и мутация не дошла бы до run_claude. См. шапку этого файла.
 TIMEOUT    = int(C.get("CLAUDE_TIMEOUT", "1800"))
 API        = f"https://api.telegram.org/bot{TOKEN}"
 INCOMING   = os.path.expanduser("~/dev/tgbridge/incoming")

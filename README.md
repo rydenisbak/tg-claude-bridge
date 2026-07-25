@@ -44,6 +44,8 @@ Voice/video transcription is the only optional extra (whisper + ffmpeg).
 - Two execution lanes: a slow side-chat/loop never blocks the main dialog (max 2 concurrent agents).
 - `/cancel` kills all in-flight agent turns (process groups — no orphaned children).
 - `/effort low…max` switches reasoning effort on the fly; `/loop N <prompt>` repeats a prompt.
+- `/model` switches the model mid-dialog — the conversation is kept (same `--resume` session),
+  only the prompt cache is lost. Short aliases plus raw `claude-…` ids for models newer than this code.
 - `!cmd` — quick allowlisted bash (jupyter-style) without waking the agent.
 - Native Telegram command menu (`setMyCommands`).
 
@@ -57,6 +59,7 @@ Voice/video transcription is the only optional extra (whisper + ffmpeg).
 | `/compact` | compress the dialog context, show before → after |
 | `/cancel` | abort all running agent turns (and the loop) |
 | `/effort low\|medium\|high\|xhigh\|max` | reasoning effort on the fly |
+| `/model opus\|opus48\|sonnet\|fable\|haiku\|default` | switch model on the fly (or a full `claude-…` id) |
 | `/btw <question>` | side-chat that sees the dialog but doesn't touch it |
 | `/loop <sec> <prompt>` | repeat a prompt every N seconds (`/loop stop`) |
 | `!<cmd>` | quick bash from the allowlist (no `rm`/`mv`/`sudo`/…) |

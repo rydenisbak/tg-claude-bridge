@@ -23,14 +23,27 @@ import os, sys, json, time, shlex, signal, socket, subprocess, threading, collec
 import urllib.request, urllib.parse, urllib.error
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # соседние tg*-модули находятся при любом запуске
 from tgconfig import (STATE_FILE, log, C, TOKEN, ALLOWED_ID, WORKDIR, CLAUDE_BIN, PERM_MODE,
-                      EFFORT_LEVELS, MODEL, TIMEOUT, API, INCOMING, OUTGOING, TGSEND, LONG_LIMIT,
+                      EFFORT_LEVELS, TIMEOUT, API, INCOMING, OUTGOING, TGSEND, LONG_LIMIT,
                       BASH_TIMEOUT, BASH_ALLOW, BASH_DENY, TG_FILE_LIMIT, full_sysprompt)
 from tgformat import md_to_html, _chunks, context_prefix
 from tgmedia import extract_audio, transcribe
 
 # --- изменяемое в рантайме состояние (в tgconfig нельзя: from-import скопировал бы значение) ---
 EFFORT   = C.get("EFFORT", "high")   # low|medium|high|xhigh|max; /effort меняет на лету
+MODEL    = C.get("CLAUDE_MODEL", "")  # "" = модель по умолчанию самого CLI; /model меняет на лету
 bash_cwd = WORKDIR                    # !cd меняет
+
+# Короткие имена для /model. CLI понимает и алиас, и полный id, но свой список нужен, чтобы
+# опечатка не улетела в claude и не убила ход невнятной сетевой ошибкой.
+MODEL_ALIASES = {
+    "opus":    "claude-opus-5",
+    "opus5":   "claude-opus-5",
+    "opus48":  "claude-opus-4-8",
+    "sonnet":  "claude-sonnet-5",
+    "fable":   "claude-fable-5",
+    "haiku":   "claude-haiku-4-5",    # окно 200K против 1M у остальных
+    "default": "",                    # снять переопределение, вернуться к модели CLI
+}
 
 # ---------- state ----------
 session_id  = None            # текущая claude-сессия основного диалога (для --resume)
@@ -82,7 +95,8 @@ def save_state():
     with state_lock:                    # без лока конкурентные потоки бьют общий .tmp
         try:
             data = {"session_id": session_id, "total_cost": total_cost, "offset": offset,
-                    "effort": EFFORT, "btw": {str(k): v for k, v in btw_threads.items()},
+                    "effort": EFFORT, "model": MODEL,
+                    "btw": {str(k): v for k, v in btw_threads.items()},
                     "reactions": pending_reactions[:]}
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -93,7 +107,7 @@ def save_state():
             log("save_state err", repr(e))
 
 def load_state():
-    global session_id, total_cost, offset, EFFORT
+    global session_id, total_cost, offset, EFFORT, MODEL
     try:
         if not os.path.isfile(STATE_FILE):
             return
@@ -108,13 +122,16 @@ def load_state():
         eff        = d.get("effort")
         if eff in EFFORT_LEVELS:
             EFFORT = eff
+        mdl = d.get("model")
+        if isinstance(mdl, str):            # "" — валидное значение (модель по умолчанию CLI)
+            MODEL = mdl
         for k, v in (d.get("btw") or {}).items():
             try:
                 btw_threads[int(k)] = v
             except Exception:
                 pass
         pending_reactions[:] = [str(x) for x in (d.get("reactions") or [])][-REACT_CAP:]
-        log(f"state loaded: session={str(session_id)[:8]} offset={offset} effort={EFFORT} btw={len(btw_threads)} react={len(pending_reactions)}")
+        log(f"state loaded: session={str(session_id)[:8]} offset={offset} effort={EFFORT} model={MODEL or 'default'} btw={len(btw_threads)} react={len(pending_reactions)}")
     except Exception as e:
         log("load_state err", repr(e))
 
@@ -308,6 +325,7 @@ def status_text():
             f"задач у агента (работа+очередь): {jobs_active}  ← перед рестартом моста должно быть 0\n"
             f"side-чатов в памяти: {len(btw_threads)}\n"
             f"effort: {EFFORT}\n"
+            f"модель: {MODEL or 'по умолчанию (CLI)'}\n"
             f"workdir: {WORKDIR}")
 
 HELP = (
@@ -319,6 +337,7 @@ HELP = (
     "/context — заполнение контекста + стоимость\n"
     "/cancel — прервать текущий ход агента (и loop)\n"
     "/effort low|medium|high|xhigh|max — скорость/качество на лету\n"
+    "/model opus|opus48|sonnet|fable|haiku|default — сменить модель (контекст диалога сохраняется)\n"
     "/btw <вопрос> — side-чат: видит контекст диалога, но НЕ влияет на него.\n"
     "   Продолжить side-чат — ответь (reply) на 💬-сообщение бота.\n"
     "   Вернулся в главный (обычное сообщение) — все боковые закрываются.\n"
@@ -342,6 +361,7 @@ BOT_COMMANDS = [
     {"command": "context", "description": "заполнение контекста + стоимость"},
     {"command": "cancel",  "description": "прервать текущий ход агента"},
     {"command": "effort",  "description": "reasoning: low | medium | high | xhigh | max"},
+    {"command": "model",   "description": "модель: opus | opus48 | sonnet | fable | haiku"},
     {"command": "btw",     "description": "боковой вопрос, не трогая главный диалог"},
     {"command": "loop",    "description": "повторять промпт каждые N сек (/loop stop — стоп)"},
     {"command": "compact", "description": "сжать контекст (покажу до → после)"},
@@ -498,7 +518,7 @@ def safe_handle_side(chat_id, text, sid):
 
 # ---------- dispatch ----------
 def handle(chat_id, text):
-    global session_id, last_data, reset_gen, EFFORT
+    global session_id, last_data, reset_gen, EFFORT, MODEL
     t = text.strip()
     low = t.lower()
 
@@ -527,6 +547,28 @@ def handle(chat_id, text):
             send(chat_id, "Уровни: low | medium | high | xhigh | max"); return
         old = EFFORT; EFFORT = lvl; save_state()
         send(chat_id, f"⚙️ effort: {old} → {EFFORT}"); return
+    if low.startswith("/model"):
+        parts = t.split()
+        if len(parts) < 2:
+            send(chat_id, f"Текущая модель: {MODEL or 'по умолчанию (CLI)'}\n"
+                          f"Использование: /model {' | '.join(MODEL_ALIASES)}\n"
+                          "или полный id: /model claude-opus-5"); return
+        arg = parts[1].lower()
+        if arg in MODEL_ALIASES:
+            new = MODEL_ALIASES[arg]
+        elif arg.startswith("claude-"):
+            new = arg                       # сырой id: новые модели без правки кода
+        else:
+            send(chat_id, f"Не знаю модель «{parts[1]}».\n"
+                          f"Алиасы: {' | '.join(MODEL_ALIASES)}\n"
+                          "или полный id, начинающийся с claude-"); return
+        old = MODEL; MODEL = new; save_state()
+        msg = (f"🧠 модель: {old or 'по умолчанию'} → {MODEL or 'по умолчанию'}\n"
+               "Применится со следующего хода. Контекст диалога сохраняется, но кэш промпта "
+               "сбросится — первый ход будет чуть дороже и медленнее.")
+        if "haiku" in MODEL:
+            msg += "\n⚠️ У haiku окно 200K против 1M у остальных — на разросшемся диалоге может не влезть."
+        send(chat_id, msg); return
     if low.startswith("/loop"):
         handle_loop(chat_id, t); return
     if low.startswith("/btw"):
