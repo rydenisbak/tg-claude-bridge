@@ -45,6 +45,22 @@ MODEL_ALIASES = {
     "default": "",                    # снять переопределение, вернуться к модели CLI
 }
 
+# Живой статус долгого хода. Видно только в stream-json: обычный --output-format json
+# отдаёт лишь финальный объект, и снаружи не понять, агент думает или ушёл в веб на 3 минуты
+# (именно так и выглядело «бот молчит» на голосовом вопросе про население).
+TOOL_LABELS = {
+    "WebSearch": "🔍 ищу в вебе",     "WebFetch": "🌐 читаю страницу",
+    "Bash":      "🛠 выполняю команды",
+    "Read": "📂 читаю файлы",         "Glob": "📂 ищу файлы",  "Grep": "📂 ищу по файлам",
+    "Edit": "✏️ правлю файлы",        "Write": "✏️ пишу файлы", "NotebookEdit": "✏️ правлю ноутбук",
+    "Task": "🤖 запустил субагента",   "TodoWrite": "📝 планирую",
+}
+SLOW_TOOLS    = ("WebSearch", "WebFetch", "Task")   # сами по себе долгие -> говорим сразу, не ждём STATUS_AFTER
+STATUS_AFTER  = 25    # сек до первого статуса: короткие ходы не трогаем
+STATUS_EARLY  = 8     # сек: раньше этого молчим даже про долгий инструмент
+STATUS_REPEAT = 90    # сек между повторами
+STATUS_MAX    = 3     # максимум статусов за ход (анти-спам)
+
 # ---------- state ----------
 session_id  = None            # текущая claude-сессия основного диалога (для --resume)
 last_data   = None            # последний json основного диалога (для /context)
@@ -264,9 +280,16 @@ def add_cost(data):
     with cost_lock:
         total_cost += (data or {}).get("total_cost_usd", 0) or 0
 
-def run_claude(prompt, resume=None, fork=False, effort=None):
-    """Запустить headless claude (промпт через stdin). Возврат (текст, data|None)."""
-    cmd = [CLAUDE_BIN, "-p", "--output-format", "json",
+def run_claude(prompt, resume=None, fork=False, effort=None, status_chat=None):
+    """Запустить headless claude (промпт через stdin). Возврат (текст, data|None) — контракт
+    тот же, что и раньше: финальное событие type=result содержит result/session_id/usage/
+    modelUsage/total_cost_usd/is_error, то есть ровно то, что читают /context и add_cost.
+
+    stream-json нужен ради живого статуса: события идут построчно, поэтому видно, каким
+    инструментом агент занят прямо сейчас. status_chat != None -> в этот чат уйдёт статус
+    долгого хода. Передавать только с пользовательских дорожек (не из loop и не из /compact).
+    """
+    cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
            "--permission-mode", PERM_MODE, "--effort", effort or EFFORT,
            "--append-system-prompt", full_sysprompt()]
     if MODEL:            cmd += ["--model", MODEL]
@@ -280,24 +303,87 @@ def run_claude(prompt, resume=None, fork=False, effort=None):
         return f"⚠️ Не смог запустить агента: {e}", None
     with proc_lock:
         current_procs.add(p)
+
+    box  = {"data": None, "tool": None, "raw": [], "err": []}
+    done = threading.Event()
+    t0   = time.time()
+
+    def pump_out():
+        try:
+            for line in p.stdout:                       # построчно, ПОКА агент работает
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    box["raw"].append(line[:500]); continue
+                if d.get("type") == "result":
+                    box["data"] = d
+                elif d.get("type") == "assistant":
+                    for b in ((d.get("message") or {}).get("content") or []):
+                        if b.get("type") == "tool_use":
+                            box["tool"] = b.get("name")
+        except Exception as e:
+            log("stream read err", repr(e))
+
+    def pump_err():
+        try:
+            for line in p.stderr:      # вычерпывать ОБЯЗАТЕЛЬНО: полная труба stderr вешает агента
+                box["err"].append(line.rstrip()[:500])
+        except Exception:
+            pass
+
+    def reporter():
+        sent, last_at, last_tool = 0, 0.0, None
+        while not done.wait(1):                         # done ставится в finally -> статус не переживёт ход
+            if sent >= STATUS_MAX:
+                return
+            el, tool = time.time() - t0, box["tool"]
+            # по расписанию — или сразу, как только агент ушёл в заведомо долгий инструмент
+            due   = (el >= STATUS_AFTER) if sent == 0 else (el - last_at >= STATUS_REPEAT)
+            early = (tool in SLOW_TOOLS and tool != last_tool
+                     and el >= STATUS_EARLY and (sent == 0 or el - last_at >= STATUS_EARLY))
+            if not (due or early):
+                continue
+            what = TOOL_LABELS.get(tool, "🛠 " + tool) if tool else "🤔 думаю"
+            send(status_chat, f"⏳ {what}… (уже {int(el)} с)")
+            sent, last_at, last_tool = sent + 1, el, tool
+
+    t_out = threading.Thread(target=pump_out, daemon=True)
+    t_err = threading.Thread(target=pump_err, daemon=True)
+    t_out.start(); t_err.start()
+    if status_chat:
+        threading.Thread(target=reporter, daemon=True).start()
     try:
-        out, err = p.communicate(input=prompt, timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        _kill(p)
-        try: p.communicate(timeout=8)
-        except Exception: pass
-        return f"⏱️ Агент не уложился в {TIMEOUT}s.", None
+        try:
+            p.stdin.write(prompt); p.stdin.close()
+        except Exception as e:                          # агент мог упасть раньше — BrokenPipe не роняет ход
+            log("stdin err", repr(e))
+        try:
+            p.wait(timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _kill(p)
+            try: p.wait(timeout=8)
+            except Exception: pass
+            return f"⏱️ Агент не уложился в {TIMEOUT}s.", None
+        t_out.join(timeout=10)                          # дочитать хвост stdout после выхода процесса
     except Exception as e:
         return f"⚠️ Ошибка агента: {e}", None
     finally:
+        done.set()
         with proc_lock:
             current_procs.discard(p)
+        for s in (p.stdout, p.stderr):
+            try: s.close()
+            except Exception: pass
+
     if p.returncode is not None and p.returncode < 0:   # убит сигналом (/cancel или таймаут-kill)
         return "⏹️ (прервано)", None
-    try:
-        data = json.loads(out.strip())
-    except Exception:
-        return (out.strip() or err.strip() or "(пустой ответ)")[:3900], None
+    data = box["data"]
+    if not data:                                        # нет result-события: отдать что было, как и раньше
+        tail = "\n".join(box["raw"][-3:]) or "\n".join(box["err"][-3:])
+        return (tail.strip() or "(пустой ответ)")[:3900], None
     if data.get("is_error"):
         return "⚠️ Ошибка агента: " + str(data.get("result", ""))[:1500], data
     return data.get("result", ""), data
@@ -503,7 +589,7 @@ def handle_side(chat_id, text, sid):
     text = take_reactions() + text              # реакции уедут этим ходом
     with Job(), Typing(chat_id):
         with side_lock:
-            res, data = run_claude(text, resume=sid)    # без fork: продолжаем именно эту ветку
+            res, data = run_claude(text, resume=sid, status_chat=chat_id)  # без fork: продолжаем эту ветку
     add_cost(data)
     save_state()
     new_sid = (data or {}).get("session_id") or sid
@@ -579,7 +665,7 @@ def handle(chat_id, text):
         q = take_reactions() + q                 # реакции уедут этим side-ходом
         with Job(), Typing(chat_id):
             with side_lock:
-                res, data = run_claude(q, resume=session_id, fork=bool(session_id))
+                res, data = run_claude(q, resume=session_id, fork=bool(session_id), status_chat=chat_id)
         add_cost(data)
         save_state()
         sid = (data or {}).get("session_id")
@@ -630,7 +716,7 @@ def handle(chat_id, text):
     with Job(), Typing(chat_id):
         with main_lock:
             gen = reset_gen
-            res, data = run_claude(t, resume=session_id)
+            res, data = run_claude(t, resume=session_id, status_chat=chat_id)
             if gen == reset_gen and data and data.get("session_id"):   # /reset во время хода -> не воскрешаем
                 session_id = data["session_id"]
                 last_data  = data
