@@ -56,10 +56,20 @@ TOOL_LABELS = {
     "Task": "🤖 запустил субагента",   "TodoWrite": "📝 планирую",
 }
 SLOW_TOOLS    = ("WebSearch", "WebFetch", "Task")   # сами по себе долгие -> говорим сразу, не ждём STATUS_AFTER
+NET_HINTS     = ("curl ", "wget ", "http://", "https://")   # bash тоже ходит в сеть — и выглядеть должен так же
 STATUS_AFTER  = 25    # сек до первого статуса: короткие ходы не трогаем
 STATUS_EARLY  = 8     # сек: раньше этого молчим даже про долгий инструмент
 STATUS_REPEAT = 90    # сек между повторами
 STATUS_MAX    = 3     # максимум статусов за ход (анти-спам)
+
+def _activity(name, inp):
+    """(метка для человека, долгий ли). Агент часто лезет в интернет не WebSearch'ем,
+    а `curl` в Bash — и тогда «выполняю команды» ничего не объясняет: надо «хожу в сеть»."""
+    if name == "Bash":
+        cmd = str((inp or {}).get("command") or "").lower()
+        if any(h in cmd for h in NET_HINTS):
+            return "🌐 хожу в сеть", True
+    return TOOL_LABELS.get(name, "🛠 " + str(name)), name in SLOW_TOOLS
 
 # ---------- state ----------
 session_id  = None            # текущая claude-сессия основного диалога (для --resume)
@@ -304,7 +314,7 @@ def run_claude(prompt, resume=None, fork=False, effort=None, status_chat=None):
     with proc_lock:
         current_procs.add(p)
 
-    box  = {"data": None, "tool": None, "raw": [], "err": []}
+    box  = {"data": None, "act": None, "slow": False, "raw": [], "err": []}
     done = threading.Event()
     t0   = time.time()
 
@@ -323,7 +333,7 @@ def run_claude(prompt, resume=None, fork=False, effort=None, status_chat=None):
                 elif d.get("type") == "assistant":
                     for b in ((d.get("message") or {}).get("content") or []):
                         if b.get("type") == "tool_use":
-                            box["tool"] = b.get("name")
+                            box["act"], box["slow"] = _activity(b.get("name"), b.get("input"))
         except Exception as e:
             log("stream read err", repr(e))
 
@@ -335,20 +345,19 @@ def run_claude(prompt, resume=None, fork=False, effort=None, status_chat=None):
             pass
 
     def reporter():
-        sent, last_at, last_tool = 0, 0.0, None
+        sent, last_at, last_act = 0, 0.0, None
         while not done.wait(1):                         # done ставится в finally -> статус не переживёт ход
             if sent >= STATUS_MAX:
                 return
-            el, tool = time.time() - t0, box["tool"]
-            # по расписанию — или сразу, как только агент ушёл в заведомо долгий инструмент
+            el, act = time.time() - t0, box["act"]
+            # по расписанию — или сразу, как только агент ушёл в заведомо долгое (веб, субагент)
             due   = (el >= STATUS_AFTER) if sent == 0 else (el - last_at >= STATUS_REPEAT)
-            early = (tool in SLOW_TOOLS and tool != last_tool
+            early = (box["slow"] and act != last_act
                      and el >= STATUS_EARLY and (sent == 0 or el - last_at >= STATUS_EARLY))
             if not (due or early):
                 continue
-            what = TOOL_LABELS.get(tool, "🛠 " + tool) if tool else "🤔 думаю"
-            send(status_chat, f"⏳ {what}… (уже {int(el)} с)")
-            sent, last_at, last_tool = sent + 1, el, tool
+            send(status_chat, f"⏳ {act or '🤔 думаю'}… (уже {int(el)} с)")
+            sent, last_at, last_act = sent + 1, el, act
 
     t_out = threading.Thread(target=pump_out, daemon=True)
     t_err = threading.Thread(target=pump_err, daemon=True)
