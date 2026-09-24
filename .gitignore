@@ -3,3 +3,9 @@ incoming/
 outgoing/
 .DS_Store
 *.pyc
+
+# личные данные трекера платежей и рабочие логи — в публичный репо не кладём
+payments.json
+payments-paid.json
+payments-log.csv
+logs/

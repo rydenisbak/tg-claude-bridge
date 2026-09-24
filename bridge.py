@@ -19,7 +19,7 @@ tgbridge — Telegram <-> Claude Code (headless) bridge.
 Состояние (session_id, стоимость, offset, effort, side-чаты) переживает рестарт:
     ~/.config/tgbridge/state.json
 """
-import os, sys, json, time, shlex, signal, socket, subprocess, threading, collections
+import os, sys, json, glob, time, shlex, signal, socket, subprocess, threading, collections
 import urllib.request, urllib.parse, urllib.error
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # соседние tg*-модули находятся при любом запуске
 from tgconfig import (STATE_FILE, log, C, TOKEN, ALLOWED_ID, WORKDIR, CLAUDE_BIN, PERM_MODE,
@@ -57,8 +57,8 @@ TOOL_LABELS = {
 }
 SLOW_TOOLS    = ("WebSearch", "WebFetch", "Task")   # сами по себе долгие -> говорим сразу, не ждём STATUS_AFTER
 NET_HINTS     = ("curl ", "wget ", "http://", "https://")   # bash тоже ходит в сеть — и выглядеть должен так же
-STATUS_AFTER  = 25    # сек до первого статуса: короткие ходы не трогаем
-STATUS_EARLY  = 8     # сек: раньше этого молчим даже про долгий инструмент
+STATUS_AFTER  = 60    # сек до первого статуса: короткие ходы не трогаем
+STATUS_EARLY  = 60    # сек: раньше этого молчим даже про долгий инструмент
 STATUS_REPEAT = 90    # сек между повторами
 STATUS_MAX    = 3     # максимум статусов за ход (анти-спам)
 
@@ -397,10 +397,48 @@ def run_claude(prompt, resume=None, fork=False, effort=None, status_chat=None):
         return "⚠️ Ошибка агента: " + str(data.get("result", ""))[:1500], data
     return data.get("result", ""), data
 
-def ctx_tokens(d):
-    """Сколько токенов контекста съел ход (по usage его json)."""
-    u = (d or {}).get("usage") or {}
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+
+def _usage_sum(u):
+    u = u or {}
     return u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+
+def ctx_from_transcript(sid):
+    """Точный размер контекста: usage последнего API-запроса сессии, из её транскрипта.
+
+    Нужно потому, что usage в result-событии — СУММА по всем запросам хода: ход с одним
+    вызовом инструмента = 2 запроса, и контекст в отчёте удваивался (853k вместо 427k).
+    """
+    if not sid:
+        return 0
+    hits = glob.glob(os.path.join(PROJECTS_DIR, "*", f"{sid}.jsonl"))
+    if not hits:
+        return 0
+    path = max(hits, key=os.path.getmtime)
+    try:
+        with open(path, "rb") as f:                     # транскрипт бывает на сотню МБ — читаем только хвост
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 400_000))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception as e:
+        log("ctx transcript err", repr(e))
+        return 0
+    for line in reversed(tail.split("\n")):
+        if '"assistant"' not in line:
+            continue
+        try: d = json.loads(line)
+        except Exception: continue                      # первая строка хвоста почти всегда обрезана
+        if d.get("type") != "assistant":
+            continue
+        n = _usage_sum((d.get("message") or {}).get("usage"))
+        if n:                                           # первый ход после /compact пишет нули
+            return n
+    return 0
+
+def ctx_tokens(d):
+    """Сколько токенов контекста занимает диалог сейчас."""
+    n = ctx_from_transcript((d or {}).get("session_id"))
+    return n or _usage_sum((d or {}).get("usage"))      # fallback: завышает при tool-use, но лучше нуля
 
 def fmt_context(d):
     ctx = ctx_tokens(d)
@@ -458,6 +496,7 @@ BOT_COMMANDS = [
     {"command": "effort",  "description": "reasoning: low | medium | high | xhigh | max"},
     {"command": "model",   "description": "модель: opus | opus48 | sonnet | fable | haiku"},
     {"command": "btw",     "description": "боковой вопрос, не трогая главный диалог"},
+    {"command": "pay",     "description": "платежи: оплатил X / покажи таблицу / добавь платёж"},
     {"command": "loop",    "description": "повторять промпт каждые N сек (/loop stop — стоп)"},
     {"command": "compact", "description": "сжать контекст (покажу до → после)"},
     {"command": "help",    "description": "что умею и все команды"},
@@ -615,6 +654,9 @@ def safe_handle_side(chat_id, text, sid):
 def handle(chat_id, text):
     global session_id, last_data, reset_gen, EFFORT, MODEL
     t = text.strip()
+    if t.lower() == "/pay" or t.lower().startswith("/pay "):   # маркер «это про платежи» -> обычный ход агента, не слэш Claude
+        rest = t[4:].strip() or "покажи таблицу платежей"
+        t = text = "[ПЛАТЕЖИ] " + rest
     low = t.lower()
 
     if low in ("/start", "/help"):
