@@ -496,7 +496,6 @@ BOT_COMMANDS = [
     {"command": "effort",  "description": "reasoning: low | medium | high | xhigh | max"},
     {"command": "model",   "description": "модель: opus | opus48 | sonnet | fable | haiku"},
     {"command": "btw",     "description": "боковой вопрос, не трогая главный диалог"},
-    {"command": "pay",     "description": "платежи: оплатил X / покажи таблицу / добавь платёж"},
     {"command": "loop",    "description": "повторять промпт каждые N сек (/loop stop — стоп)"},
     {"command": "compact", "description": "сжать контекст (покажу до → после)"},
     {"command": "help",    "description": "что умею и все команды"},
@@ -654,9 +653,6 @@ def safe_handle_side(chat_id, text, sid):
 def handle(chat_id, text):
     global session_id, last_data, reset_gen, EFFORT, MODEL
     t = text.strip()
-    if t.lower() == "/pay" or t.lower().startswith("/pay "):   # маркер «это про платежи» -> обычный ход агента, не слэш Claude
-        rest = t[4:].strip() or "покажи таблицу платежей"
-        t = text = "[ПЛАТЕЖИ] " + rest
     low = t.lower()
 
     if low in ("/start", "/help"):
