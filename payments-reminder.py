@@ -11,12 +11,12 @@ CLI:
   payments-reminder.py                  штатный прогон (шлёт напоминания)
   payments-reminder.py --dry            то же, но печатает в консоль
   payments-reminder.py --status         таблица статусов за текущий месяц
-  payments-reminder.py --paid Ипотека   отметить оплаченным (поиск по части имени)
-  payments-reminder.py --paid all       отметить всё, что напоминалось сейчас
+  payments-reminder.py --paid Ипотека   отметить оплаченным (точное имя или уникальная часть)
+  payments-reminder.py --paid all       отметить всё со сроком сегодня..+2 дня (просроченное — только по имени)
   payments-reminder.py --unpaid Ипотека снять отметку
   payments-reminder.py --days 30        обзор на N дней вперёд
-  payments-reminder.py --move Вольво 17.02   перенести ближайшее вхождение
-  payments-reminder.py --move Вольво reset   снять переносы
+  payments-reminder.py --move "ТО Вольво" 17.02   перенести ближайшее вхождение
+  payments-reminder.py --move "ТО Вольво" reset   снять переносы
   payments-reminder.py --paid ЖКХ --amount 26500   отметить с фактической суммой
   payments-reminder.py --report            факт за текущий месяц
   payments-reminder.py --report 09.2026    факт за месяц
@@ -91,12 +91,17 @@ def log_save(rows):
         w.writerows(sorted(rows, key=lambda r: (r["date"], r["name"])))
 
 
+def num(x):
+    """Число для журнала без потери точности (%g резал до 6 знаков: 1234567.5 -> 1.23457e+06)."""
+    return ("%.2f" % float(x)).rstrip("0").rstrip(".")
+
+
 def log_add(name, date, fact, currency, plan, note=""):
     """Записать факт оплаты. Повторная отметка того же платежа перезаписывает строку."""
     rows = [r for r in log_rows()
             if not (r["name"] == name and r["date"] == date.isoformat())]
-    rows.append({"date": date.isoformat(), "name": name, "fact": "%g" % float(fact),
-                 "currency": currency, "plan": "%g" % float(plan), "note": note})
+    rows.append({"date": date.isoformat(), "name": name, "fact": num(fact),
+                 "currency": currency, "plan": num(plan), "note": note})
     log_save(rows)
 
 
@@ -192,6 +197,10 @@ def moved_from(p, date):
 def due_on(p, date):
     if not p.get("active", True):
         return False
+    # start: с какой даты платёж существует. Без него новая ежемесячная подписка
+    # «с 28.09» сразу считалась просроченной за 28.08 (lookback смотрит назад).
+    if p.get("start") and date < dt.date.fromisoformat(str(p["start"])):
+        return False
     return due_date_in(p, date.year, date.month) == date
 
 
@@ -209,6 +218,14 @@ def last_due(p, today, lookback=LOOKBACK):
     return None
 
 
+def is_paid_for(paid, p, d):
+    """Оплачено ли вхождение d. paid хранит ОДНУ дату на платёж — последнюю отмеченную,
+    поэтому отметка более поздней даты закрывает и все ранние. Без этого оплата ЖКХ
+    заранее (30.09) «воскрешала» 31.08 как просроченное."""
+    last = paid.get(p["name"])
+    return bool(last) and last >= d.isoformat()
+
+
 def nearest_due(p, today, window=7, paid=None):
     """Ближайшая дата платежа: сначала неоплаченные, иначе просто ближайшая."""
     if is_window(p):                       # для окна «дата» = крайний срок
@@ -224,8 +241,11 @@ def nearest_due(p, today, window=7, paid=None):
     if not cands:
         return None
     paid = paid or {}
-    unpaid = [d for d in cands if paid.get(p["name"]) != d.isoformat()]
-    pool = unpaid or cands
+    unpaid = [d for d in cands if not is_paid_for(paid, p, d)]
+    # Просроченное закрываем первым, а не ближайшее будущее. paid хранит одну (последнюю)
+    # дату, поэтому просроченным считается только то, что ПОЗЖЕ последней отметки.
+    overdue = [d for d in unpaid if d < today]
+    pool = overdue or unpaid or cands
     return min(pool, key=lambda d: abs((d - today).days))
 
 
@@ -235,11 +255,23 @@ def fmt_money(x):
 
 
 def money(x):
+    # Отрицательная сумма = деньги ПРИХОДЯТ (проценты по займу и т.п.): «получить 267 781».
+    if float(x) < 0:
+        return "получить " + money(-float(x))
     s = "{:,.0f}".format(float(x)) if float(x) == int(float(x)) else "{:,.2f}".format(float(x))
     return s.replace(",", " ")
 
 
+def add_sum(by_cur, cur, amount):
+    """Копим только то, что ПЛАТИТЬ: поступления не вычитаются из «перевести» —
+    30 000 за ЖКХ всё равно надо перевести, даже если завтра придут проценты."""
+    if float(amount) > 0:
+        by_cur[cur] = by_cur.get(cur, 0) + float(amount)
+
+
 def totals_str(by_cur):
+    if not by_cur:
+        return "<b>ничего</b>"
     return " + ".join("<b>%s %s</b>" % (money(v), k) for k, v in by_cur.items())
 
 
@@ -266,28 +298,28 @@ def do_remind(dry=False):
         d = last_due(p, today)
         if d is None or d >= today or d < since:
             continue
-        if paid.get(p["name"]) == d.isoformat():
+        if is_paid_for(paid, p, d):
             continue
         cur = p.get("currency", sched.get("currency_default", "RUB"))
-        dby[cur] = dby.get(cur, 0) + float(p["amount"])
+        add_sum(dby, cur, p["amount"])
         note = " — <i>%s</i>" % p["note"] if p.get("note") else ""
         dlines.append("• <b>%s</b> — %s %s · срок был %s (%d дн. назад)%s"
                       % (p["name"], money(p["amount"]), cur,
                          d.strftime("%d.%m"), (today - d).days, note))
     if dlines:
-        blocks.append("🔴 <b>Просрочено</b>\n\n%s\n\n➡️ Нужно: %s"
-                      % ("\n".join(dlines), totals_str(dby)))
+        blocks.append("🔴 <b>Просрочено</b>\n\n%s%s"
+                      % ("\n".join(dlines), ("\n\n➡️ Нужно: %s" % totals_str(dby)) if dby else ""))
 
     # окна: напоминаем КАЖДЫЙ день, пока не отмечено сделанным
     wlines, wby = [], {}
     for p in windows:
         df, dl = win_range(p)
-        if paid.get(p["name"]) == dl.isoformat():
+        if is_paid_for(paid, p, dl):
             continue
         if today < df - dt.timedelta(days=1):
             continue
         cur = p.get("currency", sched.get("currency_default", "RUB"))
-        wby[cur] = wby.get(cur, 0) + float(p["amount"])
+        add_sum(wby, cur, p["amount"])
         left = (dl - today).days
         if today < df:
             when = "окно открывается завтра, %s–%s" % (df.strftime("%d.%m"), dl.strftime("%d.%m"))
@@ -302,23 +334,26 @@ def do_remind(dry=False):
         blocks.append("🗓 <b>Сделать в любой день</b>\n\n%s\n\n➡️ Отложить: %s"
                       % ("\n".join(wlines), totals_str(wby)))
 
+    any_pay = bool(dby) or bool(wby)            # есть ли что ПЛАТИТЬ (поступления не в счёт)
     for offset, title in ((2, "Через 2 дня"), (1, "Завтра"), (0, "СЕГОДНЯ")):
         target = today + dt.timedelta(days=offset)
         due = [p for p in regular if due_on(p, target)]
         # отмеченное оплаченным не напоминаем ни на одном слоте: платёж можно закрыть
         # сильно заранее (ОСАГО за две недели), и «через 2 дня» по нему уже просто шум
-        due = [p for p in due if paid.get(p["name"]) != target.isoformat()]
+        due = [p for p in due if not is_paid_for(paid, p, target)]
         if not due:
             continue
         by_cur, lines = {}, []
         for p in due:
             cur = p.get("currency", sched.get("currency_default", "RUB"))
-            by_cur[cur] = by_cur.get(cur, 0) + float(p["amount"])
+            add_sum(by_cur, cur, p["amount"])
             note = " — <i>%s</i>" % p["note"] if p.get("note") else ""
             lines.append("• <b>%s</b> — %s %s%s" % (p["name"], money(p["amount"]), cur, note))
         icon = "🔔" if offset == 0 else "💳"
-        blocks.append("%s <b>%s, %s</b>\n\n%s\n\n➡️ Перевести: %s"
-                      % (icon, title, ru_date(target), "\n".join(lines), totals_str(by_cur)))
+        blocks.append("%s <b>%s, %s</b>\n\n%s%s"
+                      % (icon, title, ru_date(target), "\n".join(lines),
+                         ("\n\n➡️ Перевести: %s" % totals_str(by_cur)) if by_cur else ""))
+        any_pay = any_pay or bool(by_cur)
 
     if not blocks:
         if dry:
@@ -326,7 +361,8 @@ def do_remind(dry=False):
         return
 
     msg = "\n\n———\n\n".join(blocks)
-    msg += "\n\n<i>Оплатил — просто напиши, отмечу.</i>"
+    msg += ("\n\n<i>Оплатил — просто напиши, отмечу.</i>" if any_pay
+            else "\n\n<i>Получил — напиши, отмечу.</i>")
     print(msg) if dry else send(msg)
 
 
@@ -337,6 +373,7 @@ def do_status(dry=False):
     today = dt.date.today()
 
     rows, left = [], {}
+    waiting_income = False
     items = []
     for p in payments:
         d = due_date_in(p, today.year, today.month)
@@ -347,7 +384,7 @@ def do_status(dry=False):
 
     for d, p in items:
         cur = p.get("currency", sched.get("currency_default", "RUB"))
-        is_paid = paid.get(p["name"]) == d.isoformat()
+        is_paid = is_paid_for(paid, p, d)
         if is_window(p):
             df, dl = win_range(p)
             when = "%s–%s" % (df.strftime("%d.%m"), dl.strftime("%d.%m"))
@@ -373,14 +410,25 @@ def do_status(dry=False):
             else:
                 icon, st = "⚪", "через %d дн." % (d - today).days
         if not is_paid:
-            left[cur] = left.get(cur, 0) + float(p["amount"])
+            add_sum(left, cur, p["amount"])
+            if float(p["amount"]) < 0:
+                waiting_income = True
         rows.append("%s <b>%s</b> — %s %s · %s · %s"
                     % (icon, p["name"], money(p["amount"]), cur, when, st))
 
     head = "📋 <b>Платежи за %s</b>\n\n" % today.strftime("%m.%Y")
-    tail = ("\n\nОсталось оплатить: %s" % totals_str(left)) if left else "\n\n✅ Всё оплачено"
+    tail = (("\n\nОсталось оплатить: %s" % totals_str(left)) if left
+            else "\n\n✅ Всё оплачено" + (", ждём поступление" if waiting_income else ""))
     msg = head + "\n".join(rows) + tail
     print(msg) if dry else send(msg)
+
+
+def match_payments(payments, query):
+    """Платежи по запросу: точное имя важнее подстроки.
+    Без этого «ChatGPT» цеплял ещё «ChatGPT (2)» и «ChatGPT (3)» и отмечал оплаченными всех разом."""
+    q = query.lower().strip()
+    exact = [p for p in payments if p["name"].strip().lower() == q]
+    return exact or [p for p in payments if q in p["name"].strip().lower()]
 
 
 def do_paid(query, mark=True, dry=False, fact=None):
@@ -389,13 +437,45 @@ def do_paid(query, mark=True, dry=False, fact=None):
     paid = load_paid()
     today = dt.date.today()
 
-    if query.lower() in ("all", "все", "всё"):
-        win = 7                                  # «всё» = только то, что реально на подходе
-        targets = [p for p in payments if nearest_due(p, today, win) is not None]
+    due_for = {}                                 # имя -> дата, которую отмечаем (только для «всё»)
+    if query.strip().lower() in ("all", "все", "всё"):
+        # «всё» = только то, о чём сейчас напоминали: срок сегодня..+2 дня и ещё не отмечено.
+        # Просроченное и «окна» сюда НЕ входят — их закрывать только по имени: раньше
+        # «всё» цепляло просроченную кошачью цепочку и давно выключенные подписки.
+        if not mark:
+            print("снимать отметки можно только по имени")
+            return
+        if fact is not None:
+            print("--amount — только для одного платежа по имени")
+            return
+        win = 2
+        skipped = []
+        for p in payments:
+            if is_window(p) or float(p["amount"]) < 0:   # поступления — только по имени
+                continue
+            # Есть неоплаченное просроченное — «всё» его не трогает: отметка более поздней
+            # даты закрыла бы и его (is_paid_for), и оно пропало бы молча.
+            ld = last_due(p, today)
+            if ld and ld < today and not is_paid_for(paid, p, ld):
+                skipped.append("%s (просрочено %s)" % (p["name"], ld.strftime("%d.%m")))
+                continue
+            for k in range(0, win + 1):
+                d = today + dt.timedelta(days=k)
+                if due_on(p, d) and not is_paid_for(paid, p, d):
+                    due_for[p["name"]] = d
+                    break
+        targets = [p for p in payments if p["name"] in due_for]
+        if skipped:
+            print("пропущено, есть просроченное — закрой по имени: " + ", ".join(skipped))
+        if not targets:
+            print("на ближайшие 2 дня неотмеченных платежей нет")
+            return
     else:
         win = 400                                # названный платёж можно закрыть заранее (ОСАГО за 2 недели)
-        q = query.lower()
-        targets = [p for p in payments if q in p["name"].lower()]
+        targets = match_payments(payments, query)
+        if len(targets) > 1:
+            print("запрос неоднозначный, уточни имя: " + ", ".join(p["name"] for p in targets))
+            return
 
     if not targets:
         print("не нашёл платёж по запросу: " + query)
@@ -403,11 +483,19 @@ def do_paid(query, mark=True, dry=False, fact=None):
 
     done = []
     for p in targets:
-        d = nearest_due(p, today, win)
+        if not mark:                             # снимаем ровно ту дату, что отмечена
+            if p["name"] not in paid:
+                print("не отмечен: " + p["name"])
+                continue
+            d = dt.date.fromisoformat(paid[p["name"]])
+        else:
+            d = due_for.get(p["name"]) or nearest_due(p, today, win, paid)
         if d is None:
             continue
         plan = float(p["amount"])
         amount = plan if fact is None else float(fact)
+        if plan < 0 and amount > 0:              # «получил 270000» по поступлению — это +, а не трата
+            amount = -amount
         cur = p.get("currency", sched.get("currency_default", "RUB"))
         if mark:
             paid[p["name"]] = d.isoformat()
@@ -441,7 +529,7 @@ def do_lookahead(days, dry=False):
         for p in payments:
             if due_on(p, d):
                 cur = p.get("currency", sched.get("currency_default", "RUB"))
-                by_cur[cur] = by_cur.get(cur, 0) + float(p["amount"])
+                add_sum(by_cur, cur, p["amount"])
                 rows.append("• %s — <b>%s</b>, %s %s"
                             % (d.strftime("%d.%m"), p["name"], money(p["amount"]), cur))
         d += dt.timedelta(days=1)
@@ -476,8 +564,7 @@ def do_move(query, when, dry=False):
     sched = load_schedule()
     payments = [x for x in sched.get("payments", []) if x.get("active", True)]
     today = dt.date.today()
-    q = query.lower()
-    targets = [x for x in payments if q in x["name"].lower()]
+    targets = match_payments(payments, query)
     if len(targets) != 1:
         print("не нашёл платёж" if not targets
               else "запрос неоднозначный: " + ", ".join(x["name"] for x in targets))
@@ -557,10 +644,11 @@ def do_report(period=None, dry=False):
     by_cur, lines = {}, []
     for r in sorted(rows, key=lambda x: x["date"]):
         fact, plan = float(r["fact"]), float(r["plan"])
-        by_cur[r["currency"]] = by_cur.get(r["currency"], 0) + fact
+        add_sum(by_cur, r["currency"], fact)
         delta = ""
         if fact != plan:
-            delta = " (план %s, %+g)" % (money(plan), fact - plan)
+            d = (plan - fact) if plan < 0 else (fact - plan)   # для поступлений «+» = пришло больше
+            delta = " (план %s, %s%s)" % (money(plan), "+" if d > 0 else "−", money(abs(d)))
         lines.append("• %s — <b>%s</b> — %s %s%s"
                      % (dt.date.fromisoformat(r["date"]).strftime("%d.%m"),
                         r["name"], money(fact), r["currency"], delta))
